@@ -110,9 +110,6 @@ const SearchPage = () => {
                   </div>
                   <h3 style={{ fontSize: '1.3rem', fontWeight: '800', marginBottom: '0.4rem' }}>{s.name}</h3>
                   <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.8rem' }}>{s.description}</p>
-                  {s.startingPrice > 0 && (
-                    <p style={{ fontSize: '1rem', fontWeight: '800', color: 'var(--primary)', marginBottom: '1.5rem' }}>RS {s.startingPrice}+</p>
-                  )}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: '900', color: 'var(--primary)' }}>
                     REQUEST QUOTE <ArrowRight size={16} />
                   </div>

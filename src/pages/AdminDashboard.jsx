@@ -78,7 +78,7 @@ const AdminDashboard = () => {
   const [servicesLoading, setServicesLoading] = useState(false);
   const [showServiceModal, setShowServiceModal] = useState(false);
   const [editingService, setEditingService] = useState(null);
-  const [serviceForm, setServiceForm] = useState({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '', startingPrice: '' });
+  const [serviceForm, setServiceForm] = useState({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '' });
   const [serviceSaving, setServiceSaving] = useState(false);
   const [serviceImgFile, setServiceImgFile] = useState(null);
   const [serviceImgPreview, setServiceImgPreview] = useState(null);
@@ -321,11 +321,11 @@ const AdminDashboard = () => {
     setServiceImgFile(null);
     if (service) {
       setEditingService(service);
-      setServiceForm({ name: service.name, icon: service.icon || 'Sparkles', color: /^#[0-9a-f]{6}$/i.test(service.color || '') ? service.color : '#3b82f6', description: service.description || '', isActive: service.isActive, imgUrl: service.imgUrl || '', startingPrice: service.startingPrice ? String(service.startingPrice) : '' });
+      setServiceForm({ name: service.name, icon: service.icon || 'Sparkles', color: /^#[0-9a-f]{6}$/i.test(service.color || '') ? service.color : '#3b82f6', description: service.description || '', isActive: service.isActive, imgUrl: service.imgUrl || '' });
       setServiceImgPreview(service.imgUrl || null);
     } else {
       setEditingService(null);
-      setServiceForm({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '', startingPrice: '' });
+      setServiceForm({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '' });
       setServiceImgPreview(null);
     }
     setServiceImgFile(null);
@@ -342,8 +342,6 @@ const AdminDashboard = () => {
   const handleServiceSave = async () => {
     if (!serviceForm.name.trim()) return;
     if (!/^#[0-9a-f]{6}$/i.test(serviceForm.color)) return setServiceError('Theme color must be a hex code like #3b82f6.');
-    const price = Number(serviceForm.startingPrice || 0);
-    if (!Number.isFinite(price) || price < 0) return setServiceError('Starting price must be 0 or more.');
     setServiceError(null);
     setServiceSaving(true);
     let finalImgUrl = null;
@@ -361,7 +359,6 @@ const AdminDashboard = () => {
       color: serviceForm.color,
       description: serviceForm.description.trim(),
       isActive: serviceForm.isActive,
-      startingPrice: price,
     };
     if (finalImgUrl) payload.imgUrl = finalImgUrl;
     const res = editingService ? await updateService(editingService.id, payload) : await createService(payload);
@@ -2821,11 +2818,6 @@ const AdminDashboard = () => {
                             <input className="input-minimal" value={serviceForm.color} onChange={e => setServiceForm(f => ({ ...f, color: e.target.value }))} placeholder="#3b82f6" style={{ flex: 1 }} />
                           </div>
                         </div>
-                      </div>
-
-                      <div>
-                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Starting Price (RS)</label>
-                        <input className="input-minimal" type="number" min="0" value={serviceForm.startingPrice} onChange={e => setServiceForm(f => ({ ...f, startingPrice: e.target.value }))} placeholder="e.g. 500" />
                       </div>
 
                       {/* Description */}

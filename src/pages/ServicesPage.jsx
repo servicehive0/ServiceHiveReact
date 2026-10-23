@@ -205,11 +205,6 @@ const ServicesPage = () => {
                         <CheckCircle size={14} color="#10b981" />
                         <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: '700' }}>Verified Experts</span>
                      </div>
-                     {s.startingPrice > 0 && (
-                       <span style={{ fontSize: '0.8rem', color: s.color || 'var(--primary)', fontWeight: '800', background: `${s.color || '#3b82f6'}15`, padding: '4px 10px', borderRadius: '100px' }}>
-                         From RS {s.startingPrice}
-                       </span>
-                     )}
                   </div>
                </div>
              </motion.div>
