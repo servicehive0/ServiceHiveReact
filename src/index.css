@@ -40,6 +40,9 @@ body {
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 10px; }
+/* sideways chip rows scroll by swipe, no bar under them */
+.chip-row { scrollbar-width: none; }
+.chip-row::-webkit-scrollbar { display: none; }
 
 /* Dynamic Layout for App/Web */
 .app-container {

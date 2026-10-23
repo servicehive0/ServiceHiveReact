@@ -128,10 +128,7 @@ function App() {
               <ProtectedRoute><SearchPage /></ProtectedRoute>
             } />
 
-            {/* Legacy direct-booking routes — kept alive as redirects (not
-                deleted) so any existing links/bookmarks still land somewhere
-                useful, in the current bidding-based flow, instead of 404ing
-                or opening the retired BookingFlow/BookingsPage wizards. */}
+            {/* old direct-booking links now open the dashboard (bookings come from bids) */}
             <Route path="/bookings" element={
               <Navigate to="/customer-dashboard" state={{ tab: 'bookings' }} replace />
             } />

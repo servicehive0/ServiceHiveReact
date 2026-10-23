@@ -4,8 +4,10 @@ import { iconMap } from '../../utils/iconMap';
 
 // Mirrors Flutter's services grid: tinted gradient card, circular icon (or
 // image) with a colored ring, 2-line label below. 3-per-row grid.
-export const ServiceGridCard = ({ name, icon, imgUrl, color = '#3B82F6', onClick }) => {
+export const ServiceGridCard = ({ name, icon, imgUrl, color: rawColor, onClick }) => {
   const Icon = iconMap[icon] || HomeIcon;
+  // the alpha suffixes below only work on a 6 digit hex colour
+  const color = /^#[0-9a-f]{6}$/i.test(rawColor || '') ? rawColor : '#3B82F6';
 
   return (
     <button onClick={onClick} style={{

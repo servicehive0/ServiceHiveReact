@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Search, Star, MapPin, Loader, ChevronRight, RefreshCw } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
+import { isOnlineNow } from '../utils/online';
 import { predictProviderRatingML } from '../lib/aiInsights';
 import ProviderProfileModal from './ProviderProfileModal';
 
@@ -32,7 +33,7 @@ const ProviderDirectoryModal = ({ user, initialService, onClose, onBookNow }) =>
     // database (even before admin approval) should still be findable here;
     // otherwise they're invisible to search until an admin approves them,
     // with no error or explanation shown to the customer searching.
-    let q = supabase.from('users').select('*, provider_profiles!inner(*)').eq('role', 'provider');
+    let q = supabase.from('users').select('*, provider_profiles!inner(*)').eq('role', 'provider').eq('is_verified', true);
     if (user?.city) q = q.eq('city', user.city);
     const { data } = await q;
     setProviders(data || []);
@@ -94,7 +95,7 @@ const ProviderDirectoryModal = ({ user, initialService, onClose, onBookNow }) =>
             <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search by name or skill..."
               style={{ flex: 1, background: 'none', border: 'none', outline: 'none', color: 'white', fontSize: '0.85rem' }} />
           </div>
-          <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
+          <div className="chip-row" style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
             <button onClick={() => setServiceFilter('')}
               style={{ flexShrink: 0, padding: '0.4rem 0.9rem', borderRadius: 100, background: !serviceFilter ? PRIMARY : '#141414', border: '1px solid rgba(255,255,255,0.1)', color: 'white', fontSize: '0.75rem', fontWeight: 700, cursor: 'pointer' }}>All</button>
             {services.map(s => (
@@ -116,7 +117,7 @@ const ProviderDirectoryModal = ({ user, initialService, onClose, onBookNow }) =>
                 style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '0.9rem', borderRadius: 16, background: '#0d0d0d', border: '1px solid rgba(255,255,255,0.07)', marginBottom: 10, cursor: 'pointer' }}>
                 <div style={{ width: 48, height: 48, borderRadius: '50%', background: `${PRIMARY}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 900, color: PRIMARY, flexShrink: 0, position: 'relative' }}>
                   {(p.name || '?')[0]?.toUpperCase()}
-                  {profile?.is_online && <div style={{ position: 'absolute', bottom: 0, right: 0, width: 12, height: 12, borderRadius: '50%', background: SUCCESS, border: '2px solid #0d0d0d' }} />}
+                  {isOnlineNow(profile) && <div style={{ position: 'absolute', bottom: 0, right: 0, width: 12, height: 12, borderRadius: '50%', background: SUCCESS, border: '2px solid #0d0d0d' }} />}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 800, fontSize: '0.92rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</div>

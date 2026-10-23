@@ -142,7 +142,12 @@ export const AuthProvider = ({ children }) => {
     // Role guard — allow admin to log in from any page
     if (role && profile.role !== role && profile.role !== 'admin') {
       await supabase.auth.signOut();
-      return { success: false, message: `This account is registered as a "${profile.role}", not "${role}".` };
+      return {
+        success: false,
+        message: profile.role === 'provider'
+          ? 'This is a service provider account. Please switch to the Provider tab to log in.'
+          : 'This is a customer account. Please switch to the Customer tab to log in.',
+      };
     }
 
     // Provider approval gate — block login until admin approves. Deliberately
@@ -574,27 +579,6 @@ export const AuthProvider = ({ children }) => {
 
   // ─── Bookings ──────────────────────────────────────────────────────────────
 
-  const createBooking = async (data) => {
-    const payload = {
-      user_id: user.id,
-      service: data.service,
-      service_slug: data.serviceSlug ?? data.service_slug,
-      address: data.address,
-      scheduled_type: data.scheduledType ?? data.scheduled_type ?? 'asap',
-      scheduled_date: data.scheduledDate ?? data.scheduled_date ?? null,
-      scheduled_time: data.scheduledTime ?? data.scheduled_time ?? null,
-      price: data.price ?? null,
-      notes: data.notes ?? null,
-    };
-    const { data: created, error } = await supabase
-      .from('bookings')
-      .insert(payload)
-      .select()
-      .single();
-    if (error) return { success: false, message: error.message };
-    return { success: true, data: mapBooking(created) };
-  };
-
   const getMyBookings = async () => {
     const { data, error } = await supabase
       .from('bookings')
@@ -606,6 +590,14 @@ export const AuthProvider = ({ children }) => {
   };
 
   const cancelBooking = async (id) => {
+    // a booking made from a request is cancelled through the request, so the bids,
+    // the OTP and the provider all get updated together
+    const { data: linked } = await supabase.from('bookings').select('request_id').eq('id', id).maybeSingle();
+    if (linked?.request_id) {
+      const { error: rpcError } = await supabase.rpc('cancel_request', { p_request_id: linked.request_id });
+      if (rpcError) return { success: false, message: rpcError.message };
+      return { success: true };
+    }
     const { data, error } = await supabase
       .from('bookings')
       .update({ status: 'cancelled' })
@@ -755,7 +747,7 @@ export const AuthProvider = ({ children }) => {
       getSiteSettings, updateSiteSettings,
       getPlatformSettings, updatePlatformSettings,
       getServices, getAllServices, getService, createService, updateService, deleteService, uploadServiceImage,
-      createBooking, getMyBookings, cancelBooking, getAllBookings,
+      getMyBookings, cancelBooking, getAllBookings,
       updateProfile, uploadAvatar, getAllUsers, deleteUser, adminUpdateUser,
       submitContact,
     }}>

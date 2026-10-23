@@ -119,7 +119,8 @@ const ChatsListTab = ({ user, role }) => {
     if (!window.confirm(`Delete conversation with ${otherName(t)}? They can still see it.`)) return;
     setThreads(prev => prev.filter(x => x.bid.id !== t.bid.id));
     try {
-      await supabase.from('hidden_chats').upsert({ user_id: user.id, bid_id: t.bid.id });
+      // send hidden_at again, otherwise a second delete keeps the old time and the chat comes back
+      await supabase.from('hidden_chats').upsert({ user_id: user.id, bid_id: t.bid.id, hidden_at: new Date().toISOString() });
     } catch { /* non-critical for this session */ }
   };
 

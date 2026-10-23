@@ -30,8 +30,9 @@ const BookingDetailModal = ({ booking, onClose, onUpdated }) => {
   const doCancel = async () => {
     if (!window.confirm('Cancel this booking?')) return;
     setCancelling(true);
-    await cancelBooking(booking.id);
+    const res = await cancelBooking(booking.id);
     setCancelling(false);
+    if (!res.success) return alert(res.message || 'Could not cancel this booking.');
     onUpdated?.();
     onClose();
   };

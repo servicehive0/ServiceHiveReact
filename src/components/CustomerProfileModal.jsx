@@ -31,13 +31,10 @@ const CustomerProfileModal = ({ customerId, onClose }) => {
       if (error || !row) { setNotFound(true); setLoading(false); return; }
       setCustomer(row);
 
-      const [{ count: posted }, { count: completed }] = await Promise.all([
-        supabase.from('service_requests').select('id', { count: 'exact', head: true }).eq('customer_id', customerId),
-        supabase.from('service_requests').select('id', { count: 'exact', head: true }).eq('customer_id', customerId).eq('status', 'completed'),
-      ]);
-      if (!active) return;
-      setRequestsPosted(posted || 0);
-      setJobsCompleted(completed || 0);
+      // the counts come from the same function (a provider can't read all
+      // requests of a customer, only the ones he bid on)
+      setRequestsPosted(Number(row.requests_posted) || 0);
+      setJobsCompleted(Number(row.jobs_completed) || 0);
       setLoading(false);
     };
     load();

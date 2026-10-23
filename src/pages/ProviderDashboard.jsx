@@ -25,7 +25,6 @@ import { StatusChip, requestStatusMeta } from '../components/ui/StatusChip';
 import { DashboardBottomNav } from '../components/ui/DashboardBottomNav';
 import { DashboardSidebar } from '../components/ui/DashboardSidebar';
 import { assessCancellationRiskML } from '../lib/aiInsights';
-import { notify } from '../lib/notify';
 
 const PRIMARY = colors.primary;
 const SUCCESS = colors.success;
@@ -94,7 +93,6 @@ const BidModal = ({ request, providerId, providerName, providerPhone, onClose, o
     });
     setLoading(false);
     if (err) { setError(err.message); return; }
-    notify(request.customer_id, 'New bid received', `${providerName} bid Rs ${price} on your ${request.service_name} request`, 'booking', { requestId: request.id });
     onSubmitted();
   };
 
@@ -237,7 +235,20 @@ const HomeTab = ({ user, profile, isOnline, onToggleOnline, activeJobs, onTabCha
     </div>
   );
 
-  const nearbyRequestsBlock = nearbyRequests.length > 0 && (
+  const emptyCard = (Icon, title, text, tab) => (
+    <div onClick={() => onTabChange(tab)}
+      style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '1.1rem', borderRadius: 16, background: colors.surface, border: `1px dashed ${colors.border}`, cursor: 'pointer' }}>
+      <div style={{ width: 40, height: 40, borderRadius: 12, background: `${PRIMARY}14`, color: PRIMARY, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><Icon size={18} /></div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 800, fontSize: '0.88rem' }}>{title}</div>
+        <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginTop: 2 }}>{text}</div>
+      </div>
+    </div>
+  );
+
+  const nearbyRequestsBlock = nearbyRequests.length === 0
+    ? emptyCard(ClipboardList, 'No new requests right now', isOnline ? 'You will get a notification when a customer near you posts one.' : 'Go online to get new requests from your city.', 'requests')
+    : (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
         <span style={{ fontWeight: 800, fontSize: '0.95rem' }}>Nearby Requests</span>
@@ -258,7 +269,9 @@ const HomeTab = ({ user, profile, isOnline, onToggleOnline, activeJobs, onTabCha
     </div>
   );
 
-  const activeJobsBlock = activeJobs.length > 0 && (
+  const activeJobsBlock = activeJobs.length === 0
+    ? emptyCard(Briefcase, 'No active jobs', 'Jobs show here once a customer accepts your bid.', 'jobs')
+    : (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
         <span style={{ fontWeight: 800, fontSize: '0.95rem' }}>Active Jobs</span>
@@ -281,6 +294,30 @@ const HomeTab = ({ user, profile, isOnline, onToggleOnline, activeJobs, onTabCha
     </div>
   );
 
+  const reviewsBlock = (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+        <span style={{ fontWeight: 800, fontSize: '0.95rem' }}>Recent Reviews</span>
+        {ratedJobs.length > 0 && <span style={{ fontSize: '0.8rem', color: PRIMARY, fontWeight: 700, cursor: 'pointer' }} onClick={() => setViewingRatings(true)}>View All</span>}
+      </div>
+      {ratedJobs.length === 0 ? (
+        <div style={{ padding: '1.1rem', borderRadius: 16, background: colors.surface, border: `1px dashed ${colors.border}`, fontSize: '0.8rem', color: colors.textMuted }}>
+          Reviews from your customers will show here.
+        </div>
+      ) : ratedJobs.slice(0, 3).map(j => (
+        <div key={j.id} style={{ padding: '0.9rem', borderRadius: 14, background: colors.surface, border: `1px solid ${colors.border}`, marginBottom: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontWeight: 800, fontSize: '0.85rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.customer_name}</span>
+            <span style={{ display: 'flex', gap: 2, flexShrink: 0 }}>
+              {[1, 2, 3, 4, 5].map(n => <Star key={n} size={12} color="#FBBF24" fill={n <= Math.round(j.rating) ? '#FBBF24' : 'none'} />)}
+            </span>
+          </div>
+          <div style={{ fontSize: '0.75rem', color: colors.textMuted, marginTop: 4 }}>{j.review?.trim() || j.service_name}</div>
+        </div>
+      ))}
+    </div>
+  );
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
       <GradientHeader
@@ -300,16 +337,20 @@ const HomeTab = ({ user, profile, isOnline, onToggleOnline, activeJobs, onTabCha
           {quickNav}
           {activeJobsBlock}
           {nearbyRequestsBlock}
+          {reviewsBlock}
         </>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: '1.75rem', alignItems: 'start' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', gap: '1.75rem', alignItems: 'start' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }}>
             {onlineToggle}
             {quickNav}
             {activeJobsBlock}
             {nearbyRequestsBlock}
           </div>
-          <StatsStrip items={stats} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }}>
+            <StatsStrip items={stats} />
+            {reviewsBlock}
+          </div>
         </div>
       )}
 
@@ -581,7 +622,16 @@ const JobsTab = ({ user }) => {
     const priceMap = {}, bidIdMap = {};
     bids.forEach(b => { priceMap[b.request_id] = b.price; bidIdMap[b.request_id] = b.id; });
     const { data: reqs } = await supabase.from('service_requests').select('*').in('id', ids).order('created_at', { ascending: false });
-    setJobs((reqs || []).map(r => ({ ...r, agreedPrice: priceMap[r.id], bidId: bidIdMap[r.id] })));
+    // the arrival code is only given to the hired provider, one job at a time
+    const withCodes = await Promise.all((reqs || []).map(async r => {
+      let otpCode = null;
+      if (r.status === 'accepted' && !r.otp_verified) {
+        const { data } = await supabase.rpc('get_job_otp', { p_request_id: r.id });
+        otpCode = data || null;
+      }
+      return { ...r, otp_code: otpCode, agreedPrice: priceMap[r.id], bidId: bidIdMap[r.id] };
+    }));
+    setJobs(withCodes);
     setLoading(false);
   };
 
@@ -619,13 +669,10 @@ const JobsTab = ({ user }) => {
 
   const markComplete = async (id) => {
     setCompleting(id);
-    await supabase.from('service_requests').update({ status: 'completed' }).eq('id', id).eq('otp_verified', true);
-    try {
-      await supabase.from('bookings').update({ status: 'completed' }).eq('request_id', id).in('status', ['confirmed', 'in_progress']);
-    } catch (_) { /* non-critical */ }
-    const job = jobs.find(j => j.id === id);
-    if (job) notify(job.customer_id, 'Job completed', `Your ${job.service_name} request has been marked complete. Rate your experience!`, 'booking', { requestId: job.id });
+    // complete_job() checks the code was confirmed, closes the booking and tells the customer
+    const { error } = await supabase.rpc('complete_job', { p_request_id: id });
     setCompleting(null);
+    if (error) { alert(error.message); return; }
     load();
   };
 
@@ -1013,6 +1060,15 @@ const ProviderDashboard = () => {
     setActiveJobs(reqs || []);
   };
 
+  // "Online" means switched on AND the dashboard is really open: ping every minute
+  useEffect(() => {
+    if (!user?.id) return;
+    const beat = () => supabase.rpc('ping');
+    beat();
+    const timer = setInterval(beat, 60000);
+    return () => clearInterval(timer);
+  }, [user?.id]);
+
   const handleToggleOnline = async () => {
     if (!user?.id) return;
     const newStatus = !isOnline;
@@ -1045,7 +1101,7 @@ const ProviderDashboard = () => {
   ];
 
   const tabContent = {
-    home:     <HomeTab user={user} profile={profile} isOnline={isOnline} onToggleOnline={handleToggleOnline} activeJobs={activeJobs} onTabChange={setActiveTab} unreadCount={unreadCount} onOpenNotifications={() => setShowNotifications(true)} isMobile={isMobile} />,
+    home:     <HomeTab user={user} profile={profile} isOnline={isOnline} onToggleOnline={handleToggleOnline} activeJobs={activeJobs} onTabChange={setActiveTab} unreadCount={unreadCount} onOpenNotifications={() => setShowNotifications(true)} isMobile={windowWidth < 1100} />,
     requests: <RequestsTab user={user} profile={profile} isOnline={isOnline} />,
     jobs:     <JobsTab user={user} />,
     chats:    <ChatsListTab user={user} role="provider" />,

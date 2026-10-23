@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { motion } from 'framer-motion';
 import { X, Shield, CheckCircle } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
-import { notify } from '../lib/notify';
 
 const PRIMARY = '#6366f1';
 const SUCCESS = '#10b981';
@@ -21,16 +20,15 @@ const OtpVerifyModal = ({ requestId, onClose, onVerified }) => {
     if (code.length < 6) { setError('Enter the 6-digit code.'); return; }
     setVerifying(true); setError('');
 
-    const { data } = await supabase.from('service_requests').select('otp_code, accepted_provider_id, service_name').eq('id', requestId).single();
-    if (!data || data.otp_code !== code.trim()) {
-      setVerifying(false);
+    // the code is checked on the server, the customer never sees it
+    const { data: ok, error: err } = await supabase.rpc('verify_job_otp', { p_request_id: requestId, p_code: code.trim() });
+    setVerifying(false);
+    if (err) { setError(err.message); return; }
+    if (!ok) {
       setError('Incorrect code. Ask your provider for the OTP shown on their app.');
       return;
     }
 
-    await supabase.from('service_requests').update({ status: 'in_progress', otp_verified: true }).eq('id', requestId);
-    notify(data.accepted_provider_id, 'OTP verified', `Customer confirmed you've arrived for the ${data.service_name} job. You can start work now.`, 'booking', { requestId });
-    setVerifying(false);
     setSuccess(true);
     setTimeout(() => { onVerified?.(); onClose(); }, 1500);
   };

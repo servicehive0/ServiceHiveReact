@@ -9,31 +9,26 @@ const AMBER = '#f59e0b';
 
 const ADJECTIVES = ['Terrible', 'Poor', 'Okay', 'Good', 'Excellent'];
 
-// Star rating + text review for a completed booking, mirrors Flutter's
-// review_screen.dart. Writes rating/review directly onto the bookings row.
+// Star rating + text review for a completed booking. Jobs that came from a
+// request are rated through rate_job(), which also updates the provider's
+// average rating in the database.
 const ReviewModal = ({ booking, onClose, onSubmitted }) => {
   const [rating, setRating] = useState(0);
   const [hover, setHover] = useState(0);
   const [review, setReview] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(false);
+  const [error, setError] = useState('');
 
   const submit = async () => {
     if (rating === 0) return;
     setSubmitting(true);
-    await supabase.from('bookings').update({ rating, review }).eq('id', booking.id);
-
-    // Best-effort: refresh the provider's aggregate rating, mirrors Flutter's
-    // review flow updating provider_profiles.rating.
-    try {
-      const { data: allRated } = await supabase.from('bookings').select('rating').eq('provider_id', booking.provider_id).not('rating', 'is', null);
-      if (allRated && allRated.length > 0) {
-        const avg = allRated.reduce((s, b) => s + b.rating, 0) / allRated.length;
-        await supabase.from('provider_profiles').update({ rating: avg }).eq('id', booking.provider_id);
-      }
-    } catch (_) { /* non-critical */ }
-
+    setError('');
+    const { error: err } = booking.request_id
+      ? await supabase.rpc('rate_job', { p_request_id: booking.request_id, p_rating: rating, p_review: review.trim() })
+      : await supabase.from('bookings').update({ rating, review: review.trim() }).eq('id', booking.id);
     setSubmitting(false);
+    if (err) { setError(err.message); return; }
     setSuccess(true);
     setTimeout(() => { onSubmitted?.(); onClose(); }, 1200);
   };
@@ -73,6 +68,7 @@ const ReviewModal = ({ booking, onClose, onSubmitted }) => {
             <textarea value={review} onChange={e => setReview(e.target.value)} rows={3} placeholder="Share your experience (optional)..."
               style={{ width: '100%', padding: '0.8rem 1rem', borderRadius: 14, background: '#141414', border: '1px solid rgba(255,255,255,0.1)', color: 'white', fontSize: '0.85rem', outline: 'none', resize: 'vertical', boxSizing: 'border-box', marginBottom: '1.2rem' }} />
 
+            {error && <div style={{ color: '#ef4444', fontSize: '0.8rem', marginBottom: '0.8rem' }}>{error}</div>}
             <motion.button whileTap={{ scale: 0.97 }} onClick={submit} disabled={rating === 0 || submitting}
               style={{ width: '100%', padding: '0.85rem', borderRadius: 100, background: rating === 0 ? '#333' : `linear-gradient(90deg,${PRIMARY},#4f46e5)`, color: 'white', fontWeight: 800, border: 'none', cursor: rating === 0 ? 'not-allowed' : 'pointer', fontSize: '0.9rem' }}>
               {submitting ? 'Submitting...' : 'Submit Review'}

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { X, Star, Briefcase, DollarSign, Wifi, WifiOff, MapPin, Phone, Mail, MoreVertical, Ban } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
+import { isOnlineNow } from '../utils/online';
 import { useAuth } from '../context/AuthContext';
 
 const PRIMARY = '#6366f1';
@@ -15,45 +16,25 @@ const AMBER = '#f59e0b';
 // since that's a safety feature independent of messaging.
 const ProviderProfileModal = ({ provider, onClose }) => {
   const { user } = useAuth();
-  // provider_profiles.rating/total_jobs are legacy columns the bidding
-  // system never writes to (see ProviderDashboard.jsx's own comment on
-  // this) — service_type/is_online/about/experience/rate_per_hour still
-  // come from provider_profiles, but rating/jobs-done are computed live
-  // from completed service_requests, same as the provider's own dashboard
-  // and Flutter's provider_profile_screen.dart, kept live via realtime so
-  // a job completing or a new review updates this modal without reopening.
+  // rating, jobs and reviews are kept up to date by the database on the
+  // provider_profiles row; realtime refreshes them while the modal is open
   const [liveProfile, setLiveProfile] = useState(provider.provider_profiles || {});
-  const [jobStats, setJobStats] = useState({ rating: 0, totalJobs: 0, reviewCount: 0 });
-
-  const loadJobStats = React.useCallback(async () => {
-    const { data } = await supabase.from('service_requests').select('rating, status')
-      .eq('accepted_provider_id', provider.id).eq('status', 'completed');
-    const completed = data || [];
-    const rated = completed.filter(r => r.rating != null);
-    const avgRating = rated.length ? rated.reduce((s, r) => s + r.rating, 0) / rated.length : 0;
-    setJobStats({ rating: avgRating, totalJobs: completed.length, reviewCount: rated.length });
-  }, [provider.id]);
 
   useEffect(() => {
     setLiveProfile(provider.provider_profiles || {});
     let active = true;
     supabase.from('provider_profiles').select('*').eq('id', provider.id).maybeSingle()
       .then(({ data }) => { if (active && data) setLiveProfile(data); });
-    loadJobStats();
 
     const profileChannel = supabase.channel(`provider_profile_modal_${provider.id}`)
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'provider_profiles', filter: `id=eq.${provider.id}` },
         (payload) => { if (active) setLiveProfile(payload.new); })
       .subscribe();
-    const jobsChannel = supabase.channel(`provider_profile_modal_jobs_${provider.id}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'service_requests', filter: `accepted_provider_id=eq.${provider.id}` },
-        () => { if (active) loadJobStats(); })
-      .subscribe();
 
-    return () => { active = false; supabase.removeChannel(profileChannel); supabase.removeChannel(jobsChannel); };
-  }, [provider.id, loadJobStats]);
+    return () => { active = false; supabase.removeChannel(profileChannel); };
+  }, [provider.id]);
 
-  const profile = { ...liveProfile, rating: jobStats.rating, total_jobs: jobStats.totalJobs, review_count: jobStats.reviewCount };
+  const profile = liveProfile;
   const initials = (provider.name || '?')[0]?.toUpperCase();
   const skills = Array.isArray(profile.skills) ? profile.skills : (typeof profile.skills === 'string' && profile.skills ? profile.skills.split(',').map(s => s.trim()) : []);
 
@@ -102,8 +83,8 @@ const ProviderProfileModal = ({ provider, onClose }) => {
             <div style={{ fontWeight: 900, fontSize: '1.3rem' }}>{provider.name}</div>
             <div style={{ fontSize: '0.9rem', color: PRIMARY, fontWeight: 700, marginTop: 4 }}>{profile.service_type}</div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}>
-              {profile.is_online ? <Wifi size={14} color={SUCCESS} /> : <WifiOff size={14} color="#64748b" />}
-              <span style={{ fontSize: '0.78rem', color: profile.is_online ? SUCCESS : '#64748b', fontWeight: 700 }}>{profile.is_online ? 'Online now' : 'Offline'}</span>
+              {isOnlineNow(profile) ? <Wifi size={14} color={SUCCESS} /> : <WifiOff size={14} color="#64748b" />}
+              <span style={{ fontSize: '0.78rem', color: isOnlineNow(profile) ? SUCCESS : '#64748b', fontWeight: 700 }}>{isOnlineNow(profile) ? 'Online now' : 'Offline'}</span>
             </div>
             {(provider.area || provider.city) && (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 6 }}>

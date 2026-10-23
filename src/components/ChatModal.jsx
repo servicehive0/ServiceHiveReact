@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { X, Send, Loader, MoreVertical, Ban, RefreshCw } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
-import { notify } from '../lib/notify';
 
 const PRIMARY = '#6366f1';
 
@@ -116,10 +115,13 @@ const ChatModal = ({ bidId, requestId, otherName, otherUserId, currentUserId, cu
     }).select().single();
 
     if (error) {
+      // give the text back so nothing typed is lost
       setMessages(prev => prev.filter(m => m.id !== tempId));
+      setText(trimmed);
+      alert(error.message);
     } else {
+      // the other person gets a notification from the database
       setMessages(prev => prev.map(m => m.id === tempId ? data : m));
-      notify(otherUserId, `New message from ${currentUserName}`, trimmed, 'chat', { bidId, requestId });
     }
     setSending(false);
   };

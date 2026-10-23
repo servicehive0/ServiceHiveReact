@@ -5,10 +5,11 @@ import { Shield, Instagram, Twitter, Facebook } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../lib/supabaseClient';
 
+const MotionLink = motion.create(Link);
+
 const Footer = () => {
   const { pathname } = useLocation();
   const { getSiteSettings } = useAuth();
-  const MotionLink = motion(Link);
   const [footerData, setFooterData] = useState(null);
 
   const fetchFooter = () => {

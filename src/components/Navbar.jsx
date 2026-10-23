@@ -4,12 +4,13 @@ import { useAuth } from '../context/AuthContext';
 import { Shield, Menu, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+const MotionLink = motion.create(Link);
+
 const Navbar = () => {
   const { user, logout } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const { pathname } = useLocation();
 
-  const MotionLink = motion(Link);
 
   const navLinks = [
     { name: 'Home', path: '/' },

@@ -14,6 +14,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../lib/supabaseClient';
+import { isOnlineNow } from '../utils/online';
 import { analyzeSentimentML, predictDemandML } from '../lib/aiInsights';
 import NotificationsModal from '../components/NotificationsModal';
 import UserLocationModal from '../components/UserLocationModal';
@@ -77,7 +78,7 @@ const AdminDashboard = () => {
   const [servicesLoading, setServicesLoading] = useState(false);
   const [showServiceModal, setShowServiceModal] = useState(false);
   const [editingService, setEditingService] = useState(null);
-  const [serviceForm, setServiceForm] = useState({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '' });
+  const [serviceForm, setServiceForm] = useState({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '', startingPrice: '' });
   const [serviceSaving, setServiceSaving] = useState(false);
   const [serviceImgFile, setServiceImgFile] = useState(null);
   const [serviceImgPreview, setServiceImgPreview] = useState(null);
@@ -247,12 +248,12 @@ const AdminDashboard = () => {
     const poll = async () => {
       const { data: profiles } = await supabase
         .from('provider_profiles')
-        .select('id, is_online, service_type');
+        .select('id, is_online, last_seen_at, service_type');
       if (!cancelled && profiles) {
         const onlineMap = {};
         const serviceMap = {};
         profiles.forEach(p => {
-          onlineMap[p.id] = p.is_online;
+          onlineMap[p.id] = isOnlineNow(p);
           if (p.service_type) serviceMap[p.id] = p.service_type;
         });
         setProviderOnlineMap(onlineMap);
@@ -320,11 +321,11 @@ const AdminDashboard = () => {
     setServiceImgFile(null);
     if (service) {
       setEditingService(service);
-      setServiceForm({ name: service.name, icon: service.icon || 'Sparkles', color: service.color || '#3b82f6', description: service.description || '', isActive: service.isActive, imgUrl: service.imgUrl || '' });
+      setServiceForm({ name: service.name, icon: service.icon || 'Sparkles', color: /^#[0-9a-f]{6}$/i.test(service.color || '') ? service.color : '#3b82f6', description: service.description || '', isActive: service.isActive, imgUrl: service.imgUrl || '', startingPrice: service.startingPrice ? String(service.startingPrice) : '' });
       setServiceImgPreview(service.imgUrl || null);
     } else {
       setEditingService(null);
-      setServiceForm({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '' });
+      setServiceForm({ name: '', icon: 'Sparkles', color: '#3b82f6', description: '', isActive: true, imgUrl: '', startingPrice: '' });
       setServiceImgPreview(null);
     }
     setServiceImgFile(null);
@@ -340,6 +341,9 @@ const AdminDashboard = () => {
 
   const handleServiceSave = async () => {
     if (!serviceForm.name.trim()) return;
+    if (!/^#[0-9a-f]{6}$/i.test(serviceForm.color)) return setServiceError('Theme color must be a hex code like #3b82f6.');
+    const price = Number(serviceForm.startingPrice || 0);
+    if (!Number.isFinite(price) || price < 0) return setServiceError('Starting price must be 0 or more.');
     setServiceError(null);
     setServiceSaving(true);
     let finalImgUrl = null;
@@ -357,6 +361,7 @@ const AdminDashboard = () => {
       color: serviceForm.color,
       description: serviceForm.description.trim(),
       isActive: serviceForm.isActive,
+      startingPrice: price,
     };
     if (finalImgUrl) payload.imgUrl = finalImgUrl;
     const res = editingService ? await updateService(editingService.id, payload) : await createService(payload);
@@ -440,8 +445,12 @@ const AdminDashboard = () => {
     setViewingUser(u);
     if (u.role === 'provider') {
       setProviderLoading(true);
-      const { data } = await supabase.from('provider_profiles').select('*').eq('id', u._id || u.id).maybeSingle();
-      setProviderProfile(data || null);
+      // CNIC and ID pictures are kept in the private provider_documents table
+      const [{ data }, { data: docs }] = await Promise.all([
+        supabase.from('provider_profiles').select('*').eq('id', u._id || u.id).maybeSingle(),
+        supabase.from('provider_documents').select('*').eq('id', u._id || u.id).maybeSingle(),
+      ]);
+      setProviderProfile(data ? { ...data, ...(docs || {}), online_now: isOnlineNow(data) } : null);
       setProviderLoading(false);
     }
   };
@@ -654,6 +663,26 @@ const AdminDashboard = () => {
   const completedBookings = realBookings.filter(b => b.status === 'completed');
   const totalRevenue = completedBookings.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
 
+  // money from completed jobs, month by month (6 months or the whole year)
+  const [revenueRange, setRevenueRange] = useState('6m');
+  const revenueMonths = useMemo(() => {
+    const now = new Date();
+    const count = revenueRange === 'year' ? now.getMonth() + 1 : 6;
+    const months = [];
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({ key: `${d.getFullYear()}-${d.getMonth()}`, label: d.toLocaleString('en', { month: 'short' }), total: 0 });
+    }
+    completedBookings.forEach(b => {
+      const d = new Date(b.created_at);
+      const m = months.find(x => x.key === `${d.getFullYear()}-${d.getMonth()}`);
+      if (m) m.total += Number(b.amount) || 0;
+    });
+    return months;
+  }, [completedBookings, revenueRange]);
+  const revenueMax = Math.max(...revenueMonths.map(m => m.total), 1);
+  const formatRs = (n) => n >= 1000 ? `RS ${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `RS ${n}`;
+
   const stats = useMemo(() => [
     { title: 'Total Revenue', value: `Rs ${totalRevenue.toLocaleString()}`, icon: <DollarSign />, color: '#10b981', trend: `${completedBookings.length} completed jobs` },
     { title: 'Active Services', value: realServices.filter(s => s.isActive).length || '—', icon: <Briefcase />, color: '#3b82f6', trend: `${realServices.length} total` },
@@ -712,15 +741,13 @@ const AdminDashboard = () => {
         (bids || []).forEach(b => { bidMap[b.request_id] = b; });
       }
 
-      // provider_profiles has the provider's registered location — the
-      // request row only ever carries provider_lat/provider_lng from LIVE
-      // tracking during an active job (null otherwise), so the detail modal
-      // needs this join to reliably show "where the provider is based".
+      // the provider's saved location is on their users row (provider_lat/lng on
+      // the request is only the live position during an active job)
       const providerIds = [...new Set(requests.map(r => r.accepted_provider_id).filter(Boolean))];
       let providerLocMap = {};
       if (providerIds.length > 0) {
         const { data: profiles } = await supabase
-          .from('provider_profiles')
+          .from('users')
           .select('id, latitude, longitude')
           .in('id', providerIds);
         (profiles || []).forEach(p => { providerLocMap[p.id] = p; });
@@ -963,32 +990,37 @@ const AdminDashboard = () => {
 
               <div style={{ display: 'grid', gridTemplateColumns: windowWidth < 1200 ? '1fr' : '2fr 1fr', gap: '2rem' }}>
                  
-                 {/* Main Chart Area (Mocked visually) */}
+                 {/* Revenue chart from completed jobs */}
                  <div className="card" style={{ borderRadius: '24px', padding: '2rem', display: 'flex', flexDirection: 'column' }}>
                     <div className="flex-between" style={{ marginBottom: '2rem' }}>
                        <div>
                           <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Revenue Analytics</h3>
                           <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Monthly platform earnings breakdown</p>
                        </div>
-                       <select className="input-minimal" style={{ width: 'auto', padding: '0.5rem 1rem' }}>
-                          <option>Last 6 Months</option>
-                          <option>This Year</option>
+                       <select className="input-minimal" style={{ width: 'auto', padding: '0.5rem 1rem' }} value={revenueRange} onChange={e => setRevenueRange(e.target.value)}>
+                          <option value="6m">Last 6 Months</option>
+                          <option value="year">This Year</option>
                        </select>
                     </div>
                     
-                    <div style={{ flex: 1, display: 'flex', alignItems: 'flex-end', gap: '2%', minHeight: '250px', paddingTop: '2rem', borderBottom: '1px solid var(--border)' }}>
-                       {/* Mock Bars */}
-                       {[40, 65, 45, 80, 55, 95].map((height, i) => (
-                          <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem' }}>
-                             <motion.div 
-                               initial={{ height: 0 }} animate={{ height: `${height}%` }} transition={{ duration: 1, delay: i * 0.1 }}
-                               style={{ width: '100%', maxWidth: '50px', background: i === 5 ? 'var(--primary)' : 'rgba(59, 130, 246, 0.2)', borderRadius: '8px 8px 0 0', position: 'relative' }}
+                    <div style={{ display: 'flex', alignItems: 'stretch', gap: '2%', height: '280px', paddingTop: '2rem', borderBottom: '1px solid var(--border)' }}>
+                       {revenueMonths.map((m, i) => {
+                          const last = i === revenueMonths.length - 1;
+                          return (
+                          <div key={m.key} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.6rem' }}>
+                             <div style={{ flex: 1, width: '100%', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+                             <motion.div
+                               title={formatRs(m.total)}
+                               initial={{ height: 0 }} animate={{ height: `${Math.max((m.total / revenueMax) * 85, m.total ? 4 : 1)}%` }} transition={{ duration: 0.8, delay: i * 0.05 }}
+                               style={{ width: '100%', maxWidth: '50px', background: last ? 'var(--primary)' : 'rgba(59, 130, 246, 0.25)', borderRadius: '8px 8px 0 0', position: 'relative' }}
                              >
-                               {i === 5 && <div style={{ position: 'absolute', top: '-30px', left: '50%', transform: 'translateX(-50%)', background: 'white', color: 'black', padding: '4px 8px', borderRadius: '6px', fontSize: '0.75rem', fontWeight: '800' }}>RS 340k</div>}
+                               {m.total > 0 && <div style={{ position: 'absolute', top: '-28px', left: '50%', transform: 'translateX(-50%)', background: last ? 'white' : 'rgba(255,255,255,0.08)', color: last ? 'black' : 'white', padding: '3px 7px', borderRadius: '6px', fontSize: '0.7rem', fontWeight: '800', whiteSpace: 'nowrap' }}>{formatRs(m.total)}</div>}
                              </motion.div>
-                             <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: '700' }}>{['May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct'][i]}</span>
+                             </div>
+                             <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: '700' }}>{m.label}</span>
                           </div>
-                       ))}
+                          );
+                       })}
                     </div>
                  </div>
 
@@ -1194,526 +1226,12 @@ const AdminDashboard = () => {
              </motion.div>
           )}
 
-          {/* ── EDIT USER MODAL ────────────────────────────────── */}
-          <AnimatePresence>
-            {editingUser && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setEditingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '440px', zIndex: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
-                    <div>
-                      <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Edit User</h3>
-                      <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.2rem' }}>{editingUser.email}</p>
-                    </div>
-                    <button onClick={() => setEditingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
-                    <div>
-                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Full Name</label>
-                      <input className="input-minimal" value={editForm.name} onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))} placeholder="Full name" />
-                    </div>
-                    <div>
-                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Phone</label>
-                      <input className="input-minimal" value={editForm.phone} onChange={e => setEditForm(f => ({ ...f, phone: e.target.value }))} placeholder="03XXXXXXXXX" />
-                    </div>
-                    <div>
-                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Role</label>
-                      <select className="input-minimal" value={editForm.role} onChange={e => setEditForm(f => ({ ...f, role: e.target.value }))}>
-                        <option value="user">Customer</option>
-                        <option value="provider">Provider</option>
-                        <option value="admin">Admin</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Address</label>
-                      <input className="input-minimal" value={editForm.address || ''} onChange={e => setEditForm(f => ({ ...f, address: e.target.value }))} placeholder="Full address" />
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: '1px solid var(--border)' }}>
-                      <input type="checkbox" id="isVerified" checked={editForm.isVerified} onChange={e => setEditForm(f => ({ ...f, isVerified: e.target.checked }))} style={{ width: '18px', height: '18px', accentColor: 'var(--primary)' }} />
-                      <label htmlFor="isVerified" style={{ fontWeight: '700', cursor: 'pointer' }}>Email Verified</label>
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', gap: '1rem', marginTop: '1.8rem' }}>
-                    <button onClick={() => setEditingUser(null)} style={{ flex: 1, padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Cancel</button>
-                    <motion.button whileHover={{ scale: 1.02 }} onClick={handleEditSave} disabled={editSaving} style={{ flex: 2, padding: '1rem', borderRadius: '100px', background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)', border: 'none', color: 'white', fontWeight: '800', cursor: 'pointer', opacity: editSaving ? 0.7 : 1 }}>
-                      {editSaving ? 'Saving...' : 'Save Changes'}
-                    </motion.button>
-                  </div>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
 
-          {/* ── VIEW USER MODAL ────────────────────────────────── */}
-          <AnimatePresence>
-            {viewingUser && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '480px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
-                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>{viewingUser.role === 'provider' ? 'Provider Details' : 'User Details'}</h3>
-                    <button onClick={() => setViewingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
-                  </div>
 
-                  {/* Avatar + Name */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1.8rem', padding: '1.2rem', background: viewingUser.role === 'provider' ? 'rgba(16,185,129,0.06)' : 'rgba(59,130,246,0.06)', borderRadius: '16px', border: `1px solid ${viewingUser.role === 'provider' ? 'rgba(16,185,129,0.2)' : 'rgba(59,130,246,0.15)'}` }}>
-                    <div style={{ width: '56px', height: '56px', borderRadius: '50%', background: viewingUser.avatarUrl ? `url(${viewingUser.avatarUrl}) center/cover` : (viewingUser.role === 'provider' ? 'linear-gradient(135deg, #10b981, #059669)' : 'linear-gradient(135deg, #3b82f6, #8b5cf6)'), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '900', fontSize: '1.3rem', flexShrink: 0 }}>
-                      {!viewingUser.avatarUrl && (viewingUser.name || '?').charAt(0).toUpperCase()}
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: '900', fontSize: '1.1rem' }}>{viewingUser.name}</div>
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{viewingUser.email}</div>
-                      {viewingUser.role === 'provider' && providerProfile?.is_online !== undefined && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '4px' }}>
-                          <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: providerProfile.is_online ? '#10b981' : '#6b7280' }} />
-                          <span style={{ fontSize: '0.72rem', color: providerProfile.is_online ? '#10b981' : 'var(--text-dim)', fontWeight: '700' }}>{providerProfile.is_online ? 'Online' : 'Offline'}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
 
-                  {/* ── Basic Info ── */}
-                  {[
-                    { label: 'Role', value: viewingUser.role === 'user' ? 'Customer' : viewingUser.role, cap: true },
-                    { label: 'Email', value: viewingUser.email || 'Not set' },
-                    { label: 'Phone', value: viewingUser.phone || 'Not set' },
-                    { label: 'City', value: viewingUser.city || 'Not set' },
-                    { label: 'Area', value: viewingUser.area || 'Not set' },
-                    { label: 'Address', value: viewingUser.address || 'Not set' },
-                    { label: 'Status', value: viewingUser.isVerified ? '✓ Verified' : '⏳ Pending Approval' },
-                    { label: 'Joined', value: viewingUser.createdAt ? new Date(viewingUser.createdAt).toLocaleString('en-PK', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—' },
-                  ].map(({ label, value, cap }) => (
-                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.8rem 0', borderBottom: '1px solid var(--border)' }}>
-                      <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700' }}>{label}</span>
-                      <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', color: label === 'Status' ? (viewingUser.isVerified ? '#10b981' : '#f59e0b') : 'inherit' }}>{value}</span>
-                    </div>
-                  ))}
 
-                  {/* ── Provider Profile Section ── */}
-                  {viewingUser.role === 'provider' && (
-                    <div style={{ marginTop: '1.5rem' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '1rem', paddingBottom: '0.6rem', borderBottom: '2px solid rgba(16,185,129,0.25)' }}>
-                        <Briefcase size={16} color="#10b981" />
-                        <span style={{ fontWeight: '900', fontSize: '0.9rem', color: '#10b981', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Provider Profile</span>
-                      </div>
 
-                      {providerLoading ? (
-                        <div style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading profile...</div>
-                      ) : !providerProfile ? (
-                        <div style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)', fontSize: '0.85rem', fontStyle: 'italic' }}>No provider profile found.</div>
-                      ) : (
-                        <>
-                          {/* Stats Row */}
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.8rem', marginBottom: '1rem' }}>
-                            {[
-                              { label: 'Rating', value: providerProfile.rating != null ? `${Number(providerProfile.rating).toFixed(1)} ★` : '—', color: '#f59e0b' },
-                              { label: 'Jobs Done', value: providerProfile.total_jobs ?? '0', color: '#3b82f6' },
-                              { label: 'Rate/hr', value: providerProfile.rate_per_hour ? `Rs ${providerProfile.rate_per_hour}` : '—', color: '#8b5cf6' },
-                            ].map(({ label, value, color }) => (
-                              <div key={label} style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', borderRadius: '12px', padding: '0.8rem', textAlign: 'center' }}>
-                                <div style={{ fontSize: '1.05rem', fontWeight: '900', color }}>{value}</div>
-                                <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', fontWeight: '700', marginTop: '2px' }}>{label}</div>
-                              </div>
-                            ))}
-                          </div>
 
-                          {/* Field List */}
-                          {[
-                            { label: 'Service Type', value: providerProfile.service_type || '—', cap: true },
-                            { label: 'CNIC', value: providerProfile.cnic || '—' },
-                            { label: 'Experience', value: providerProfile.experience || '—' },
-                            { label: 'Skills', value: Array.isArray(providerProfile.skills) && providerProfile.skills.length ? providerProfile.skills.join(', ') : (typeof providerProfile.skills === 'string' && providerProfile.skills ? providerProfile.skills : '—') },
-                          ].map(({ label, value, cap }) => (
-                            <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '0.75rem 0', borderBottom: '1px solid var(--border)', gap: '1rem' }}>
-                              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
-                              <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', textAlign: 'right', wordBreak: 'break-word' }}>{value}</span>
-                            </div>
-                          ))}
-
-                          {/* About */}
-                          {providerProfile.about && (
-                            <div style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', border: '1px solid var(--border)' }}>
-                              <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>About</div>
-                              <p style={{ fontSize: '0.85rem', color: 'var(--text-dim)', lineHeight: '1.6', margin: 0 }}>{providerProfile.about}</p>
-                            </div>
-                          )}
-
-                          {/* KYC Documents — must be visible before approving, otherwise
-                              approval happens blind without ever seeing the actual ID/selfie. */}
-                          <div style={{ marginTop: '1.2rem' }}>
-                            <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.6rem' }}>KYC Documents</div>
-                            {[
-                              { label: 'CNIC Front', url: providerProfile.cnic_front_url },
-                              { label: 'CNIC Back', url: providerProfile.cnic_back_url },
-                              { label: 'Selfie with ID', url: providerProfile.selfie_url },
-                              { label: 'Work Portfolio', url: providerProfile.portfolio_url },
-                              { label: 'Certificates', url: providerProfile.certificates_url },
-                            ].every(d => !d.url) ? (
-                              <div style={{ padding: '0.9rem', borderRadius: '12px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', color: '#f59e0b', fontSize: '0.8rem', fontWeight: '700' }}>
-                                No KYC documents were uploaded — do not approve without verifying identity another way.
-                              </div>
-                            ) : (
-                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.7rem' }}>
-                                {[
-                                  { label: 'CNIC Front', url: providerProfile.cnic_front_url },
-                                  { label: 'CNIC Back', url: providerProfile.cnic_back_url },
-                                  { label: 'Selfie with ID', url: providerProfile.selfie_url },
-                                  { label: 'Work Portfolio', url: providerProfile.portfolio_url },
-                                  { label: 'Certificates', url: providerProfile.certificates_url },
-                                ].map(({ label, url }) => (
-                                  <a
-                                    key={label}
-                                    href={url || undefined}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    style={{
-                                      display: 'flex', flexDirection: 'column', gap: '0.4rem',
-                                      borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--border)',
-                                      background: 'rgba(255,255,255,0.02)', textDecoration: 'none',
-                                      pointerEvents: url ? 'auto' : 'none', opacity: url ? 1 : 0.4,
-                                    }}
-                                  >
-                                    {url ? (
-                                      <img src={url} alt={label} style={{ width: '100%', height: '90px', objectFit: 'cover', display: 'block' }} />
-                                    ) : (
-                                      <div style={{ width: '100%', height: '90px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: '0.7rem' }}>Not uploaded</div>
-                                    )}
-                                    <span style={{ fontSize: '0.7rem', fontWeight: '700', color: 'var(--text-muted)', padding: '0 0.6rem 0.6rem' }}>{label}</span>
-                                  </a>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )}
-
-                  {/* ── Action Buttons ── */}
-                  <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
-                    {viewingUser.role === 'provider' && !viewingUser.isVerified && (<>
-                      <button
-                        onClick={() => handleApproveProvider(viewingUser)}
-                        style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(16,185,129,0.15)', border: '1px solid rgba(16,185,129,0.4)', color: '#10b981', fontWeight: '800', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
-                      >
-                        <CheckCircle size={16} /> APPROVE PROVIDER
-                      </button>
-                      <button
-                        onClick={() => handleRejectProvider(viewingUser)}
-                        style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', color: '#f59e0b', fontWeight: '800', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
-                      >
-                        <X size={16} /> REJECT (delete account, they re-register)
-                      </button>
-                    </>)}
-                    <button onClick={() => { handleDeleteUser(viewingUser); setViewingUser(null); }} style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}>Delete User</button>
-                  </div>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
-
-          <AnimatePresence>
-            {viewingLocationUser && (
-              <UserLocationModal user={viewingLocationUser} onClose={() => setViewingLocationUser(null)} />
-            )}
-          </AnimatePresence>
-
-          {/* ── REJECTED APPLICATIONS LOG ─────────────────────────── */}
-          <AnimatePresence>
-            {showRejectedLog && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { setShowRejectedLog(false); setViewingRejected(null); }} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: viewingRejected ? '480px' : '760px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>
-                      {viewingRejected ? 'Rejected Application' : 'Rejected Applications'}
-                    </h3>
-                    <button
-                      onClick={() => viewingRejected ? setViewingRejected(null) : (() => { setShowRejectedLog(false); setViewingRejected(null); })()}
-                      style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}
-                    ><X size={18} /></button>
-                  </div>
-
-                  {viewingRejected ? (
-                    <>
-                      <div style={{ padding: '0.9rem 1.1rem', borderRadius: '14px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', marginBottom: '1.2rem' }}>
-                        <div style={{ fontSize: '0.72rem', fontWeight: '800', color: '#ef4444', textTransform: 'uppercase', marginBottom: '0.3rem' }}>Rejection Reason</div>
-                        <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>{viewingRejected.rejection_reason}</div>
-                      </div>
-
-                      {[
-                        { label: 'Name', value: viewingRejected.name || '—' },
-                        { label: 'Email', value: viewingRejected.email || '—' },
-                        { label: 'Phone', value: viewingRejected.phone || '—' },
-                        { label: 'City', value: viewingRejected.city || '—' },
-                        { label: 'Area', value: viewingRejected.area || '—' },
-                        { label: 'Address', value: viewingRejected.address || '—' },
-                        { label: 'CNIC', value: viewingRejected.cnic || '—' },
-                        { label: 'Service Type', value: viewingRejected.service_type || '—', cap: true },
-                        { label: 'Experience', value: viewingRejected.experience || '—' },
-                        { label: 'Skills', value: Array.isArray(viewingRejected.skills) && viewingRejected.skills.length ? viewingRejected.skills.join(', ') : '—' },
-                        { label: 'Rejected At', value: viewingRejected.rejected_at ? new Date(viewingRejected.rejected_at).toLocaleString('en-PK', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—' },
-                      ].map(({ label, value, cap }) => (
-                        <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', padding: '0.75rem 0', borderBottom: '1px solid var(--border)' }}>
-                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
-                          <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', textAlign: 'right', wordBreak: 'break-word' }}>{value}</span>
-                        </div>
-                      ))}
-
-                      {(viewingRejected.cnic_front_url || viewingRejected.cnic_back_url || viewingRejected.selfie_url || viewingRejected.portfolio_url || viewingRejected.certificates_url) && (
-                        <div style={{ marginTop: '1.2rem' }}>
-                          <div style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.7rem' }}>KYC Documents</div>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.7rem' }}>
-                            {[
-                              { label: 'CNIC Front', url: viewingRejected.cnic_front_url },
-                              { label: 'CNIC Back', url: viewingRejected.cnic_back_url },
-                              { label: 'Selfie', url: viewingRejected.selfie_url },
-                              { label: 'Portfolio', url: viewingRejected.portfolio_url },
-                              { label: 'Certificates', url: viewingRejected.certificates_url },
-                            ].filter(d => d.url).map(d => (
-                              <a key={d.label} href={d.url} target="_blank" rel="noreferrer" style={{ display: 'block', borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--border)' }}>
-                                <img src={d.url} alt={d.label} style={{ width: '100%', height: '90px', objectFit: 'cover', display: 'block' }} />
-                                <div style={{ padding: '0.4rem 0.6rem', fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: '700' }}>{d.label}</div>
-                              </a>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <button
-                        onClick={() => handleDeleteRejectedLog(viewingRejected.id)}
-                        style={{ width: '100%', marginTop: '1.5rem', padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}
-                      >Delete Log Entry</button>
-                    </>
-                  ) : rejectedLoading ? (
-                    <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>Loading...</div>
-                  ) : rejectedApplications.length === 0 ? (
-                    <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>No rejected applications on record.</div>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                      {rejectedApplications.map(r => (
-                        <div key={r.id} onClick={() => setViewingRejected(r)} style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', borderRadius: '14px', background: 'rgba(239,68,68,0.04)', border: '1px solid rgba(239,68,68,0.15)', cursor: 'pointer' }}>
-                          <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: 'linear-gradient(135deg, #ef4444, #b91c1c)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '800', fontSize: '0.9rem', flexShrink: 0 }}>
-                            {(r.name || '?').charAt(0).toUpperCase()}
-                          </div>
-                          <div style={{ minWidth: 0, flex: 1 }}>
-                            <div style={{ fontWeight: '800', fontSize: '0.9rem' }}>{r.name || 'Unknown'}</div>
-                            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.email}</div>
-                            <div style={{ fontSize: '0.75rem', color: '#ef4444', marginTop: '0.2rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.rejection_reason}</div>
-                          </div>
-                          <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', flexShrink: 0 }}>
-                            {r.rejected_at ? new Date(r.rejected_at).toLocaleDateString('en-PK', { day: 'numeric', month: 'short' }) : ''}
-                          </div>
-                          <ChevronRight size={16} color="var(--text-dim)" />
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
-
-          {/* ── CONTACT MESSAGE DETAIL MODAL ─────────────────────────── */}
-          <AnimatePresence>
-            {viewingContact && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingContact(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '480px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Message Details</h3>
-                    <button onClick={() => setViewingContact(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1.2rem' }}>
-                    {viewingContact.sender_role && (
-                      <span style={{
-                        padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', textTransform: 'capitalize',
-                        background: viewingContact.sender_role === 'provider' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(59, 130, 246, 0.12)',
-                        color: viewingContact.sender_role === 'provider' ? '#10b981' : 'var(--primary)',
-                      }}>
-                        {viewingContact.sender_role}
-                      </span>
-                    )}
-                    {viewingContact.sender_specialization && (
-                      <span style={{ padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', background: 'rgba(245, 158, 11, 0.12)', color: '#f59e0b' }}>
-                        {viewingContact.sender_specialization}
-                      </span>
-                    )}
-                    {!viewingContact.sender_role && (
-                      <span style={{ padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', background: 'rgba(255,255,255,0.05)', color: 'var(--text-dim)' }}>
-                        Guest (not logged in)
-                      </span>
-                    )}
-                    <StatusBadge status={viewingContact.status === 'resolved' ? 'Completed' : 'Pending'} />
-                  </div>
-
-                  {[
-                    { label: 'Name', value: viewingContact.name || '—' },
-                    { label: 'Email', value: viewingContact.email || '—' },
-                    { label: 'Phone', value: viewingContact.phone || '—' },
-                    { label: 'Subject', value: viewingContact.subject || '—' },
-                    { label: 'Received', value: new Date(viewingContact.created_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) },
-                  ].map((row, i) => (
-                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.7rem 0', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                      <span style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{row.label}</span>
-                      <span style={{ fontWeight: '700', fontSize: '0.85rem', textAlign: 'right' }}>{row.value}</span>
-                    </div>
-                  ))}
-
-                  <div style={{ marginTop: '1rem' }}>
-                    <div style={{ color: 'var(--text-muted)', fontSize: '0.72rem', fontWeight: '800', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Message</div>
-                    <div style={{ padding: '1rem', borderRadius: '14px', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', fontSize: '0.85rem', lineHeight: '1.6', color: 'var(--text-muted)', whiteSpace: 'pre-wrap' }}>
-                      {viewingContact.message}
-                    </div>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: '0.8rem', marginTop: '1.8rem' }}>
-                    {viewingContact.status === 'resolved' ? (
-                      <button onClick={() => handleMarkContactResolved(viewingContact.id, 'new')} style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(255,255,255,0.05)', border: '1px solid var(--border)', color: 'white', fontWeight: '800', cursor: 'pointer' }}>Mark as New</button>
-                    ) : (
-                      <button onClick={() => handleMarkContactResolved(viewingContact.id, 'resolved')} style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', color: '#10b981', fontWeight: '800', cursor: 'pointer' }}>Mark Resolved</button>
-                    )}
-                    <button onClick={() => handleDeleteContactMessage(viewingContact.id)} style={{ padding: '0.9rem 1.2rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}><Trash2 size={16} /></button>
-                  </div>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
-
-          {/* ── REJECT PROVIDER MODAL ─────────────────────────────── */}
-          <AnimatePresence>
-            {rejectingUser && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => !rejectSubmitting && setRejectingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '440px', zIndex: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                    <h3 style={{ fontWeight: '900', fontSize: '1.15rem' }}>Reject {rejectingUser.name}</h3>
-                    <button onClick={() => !rejectSubmitting && setRejectingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
-                  </div>
-                  <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: '1.6', marginBottom: '1.2rem' }}>
-                    Their account will be deleted and this reason logged. They'll see it on their app and can register again with the same email.
-                  </p>
-                  <label style={{ fontSize: '0.7rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem', display: 'block' }}>Reason for Rejection</label>
-                  <textarea
-                    autoFocus
-                    value={rejectReasonInput}
-                    onChange={e => setRejectReasonInput(e.target.value)}
-                    placeholder="e.g. CNIC photo doesn't match selfie"
-                    rows={4}
-                    style={{ width: '100%', padding: '0.9rem', borderRadius: '14px', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', color: 'white', fontSize: '0.9rem', fontFamily: 'inherit', resize: 'vertical', marginBottom: '1.5rem' }}
-                  />
-                  <div style={{ display: 'flex', gap: '0.8rem' }}>
-                    <button
-                      onClick={() => setRejectingUser(null)}
-                      disabled={rejectSubmitting}
-                      style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(255,255,255,0.05)', border: '1px solid var(--border)', color: 'white', fontWeight: '800', cursor: rejectSubmitting ? 'not-allowed' : 'pointer' }}
-                    >Cancel</button>
-                    <button
-                      onClick={confirmRejectProvider}
-                      disabled={rejectSubmitting || !rejectReasonInput.trim()}
-                      style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#ef4444', fontWeight: '800', cursor: (rejectSubmitting || !rejectReasonInput.trim()) ? 'not-allowed' : 'pointer', opacity: (rejectSubmitting || !rejectReasonInput.trim()) ? 0.5 : 1 }}
-                    >{rejectSubmitting ? 'Rejecting...' : 'Reject & Delete'}</button>
-                  </div>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
-
-          {/* ── SERVICE CREATE/EDIT MODAL ─────────────────────────── */}
-          <AnimatePresence>
-            {showServiceModal && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowServiceModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', width: '100%', maxWidth: '540px', zIndex: 1, maxHeight: '92vh', overflowY: 'auto' }}>
-
-                  {/* Image Banner */}
-                  <div style={{ height: '160px', position: 'relative', borderRadius: '28px 28px 0 0', overflow: 'hidden', background: serviceImgPreview ? 'transparent' : `linear-gradient(135deg, ${serviceForm.color}30, ${serviceForm.color}08)`, cursor: 'pointer' }} onClick={() => document.getElementById('svc-img-input').click()}>
-                    {serviceImgPreview
-                      ? <img src={serviceImgPreview} alt="preview" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                      : <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
-                          <div style={{ color: serviceForm.color, opacity: 0.4, transform: 'scale(3.5)', marginBottom: '0.5rem' }}>{SERVICE_ICONS[serviceForm.icon] || SERVICE_ICONS.Sparkles}</div>
-                        </div>
-                    }
-                    <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', color: 'white', fontWeight: '800', fontSize: '0.85rem' }}>
-                      <ImageIcon size={18} /> {serviceImgPreview ? 'Click to change image' : 'Click to upload image'}
-                    </div>
-                    <input id="svc-img-input" type="file" accept="image/*" style={{ display: 'none' }} onChange={handleServiceImgPick} />
-                    {/* Floating icon badge */}
-                    <div style={{ position: 'absolute', bottom: '-20px', left: '24px', color: serviceForm.color, background: '#0f0f0f', border: `2px solid ${serviceForm.color}40`, width: '48px', height: '48px', borderRadius: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 16px rgba(0,0,0,0.4)' }}>
-                      {SERVICE_ICONS[serviceForm.icon] || SERVICE_ICONS.Sparkles}
-                    </div>
-                  </div>
-
-                  <div style={{ padding: '2rem', paddingTop: '2.8rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.8rem' }}>
-                      <div>
-                        <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>{editingService ? 'Edit Service' : 'Create New Service'}</h3>
-                        <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: '0.2rem' }}>Visible on web app, mobile app, and provider registration.</p>
-                      </div>
-                      <button onClick={() => setShowServiceModal(false)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer', flexShrink: 0 }}><X size={18} /></button>
-                    </div>
-
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
-                      {/* Name */}
-                      <div>
-                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Service Name *</label>
-                        <input className="input-minimal" value={serviceForm.name} onChange={e => setServiceForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. AC Repair, Deep Cleaning" />
-                      </div>
-
-                      {/* Icon + Color */}
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-                        <div>
-                          <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Icon</label>
-                          <select className="input-minimal" value={serviceForm.icon} onChange={e => setServiceForm(f => ({ ...f, icon: e.target.value }))}>
-                            {ICON_NAMES.map(n => <option key={n} value={n}>{n}</option>)}
-                          </select>
-                        </div>
-                        <div>
-                          <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Theme Color</label>
-                          <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
-                            <input type="color" value={serviceForm.color} onChange={e => setServiceForm(f => ({ ...f, color: e.target.value }))} style={{ width: '44px', height: '44px', border: 'none', borderRadius: '10px', cursor: 'pointer', background: 'none', flexShrink: 0 }} />
-                            <input className="input-minimal" value={serviceForm.color} onChange={e => setServiceForm(f => ({ ...f, color: e.target.value }))} placeholder="#3b82f6" style={{ flex: 1 }} />
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Description */}
-                      <div>
-                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Description</label>
-                        <textarea className="input-minimal" rows={3} value={serviceForm.description} onChange={e => setServiceForm(f => ({ ...f, description: e.target.value }))} placeholder="Brief description shown on the services page..." style={{ resize: 'none' }} />
-                      </div>
-
-                      {/* Active toggle */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '0.9rem 1rem', background: serviceForm.isActive ? 'rgba(16,185,129,0.06)' : 'rgba(239,68,68,0.06)', borderRadius: '14px', border: `1px solid ${serviceForm.isActive ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)'}`, cursor: 'pointer' }} onClick={() => setServiceForm(f => ({ ...f, isActive: !f.isActive }))}>
-                        {serviceForm.isActive ? <ToggleRight size={24} color="#10b981" /> : <ToggleLeft size={24} color="#ef4444" />}
-                        <div>
-                          <div style={{ fontWeight: '800', fontSize: '0.9rem', color: serviceForm.isActive ? '#10b981' : '#ef4444' }}>
-                            {serviceForm.isActive ? 'Active' : 'Disabled'}
-                          </div>
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                            {serviceForm.isActive ? 'Visible to customers and providers' : 'Hidden from all users'}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    {serviceError && (
-                      <div style={{ marginTop: '1rem', padding: '0.9rem 1rem', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', color: '#ef4444', fontSize: '0.82rem', fontWeight: '600', lineHeight: '1.5' }}>
-                        ⚠ {serviceError}
-                      </div>
-                    )}
-                    <div style={{ display: 'flex', gap: '1rem', marginTop: '1.2rem' }}>
-                      <button onClick={() => setShowServiceModal(false)} style={{ flex: 1, padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Cancel</button>
-                      <motion.button whileHover={{ scale: 1.02 }} onClick={handleServiceSave} disabled={serviceSaving || !serviceForm.name.trim()} style={{ flex: 2, padding: '1rem', borderRadius: '100px', background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)', border: 'none', color: 'white', fontWeight: '800', cursor: 'pointer', opacity: (serviceSaving || !serviceForm.name.trim()) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
-                        <Save size={16} /> {serviceImgUploading ? 'Uploading...' : serviceSaving ? 'Saving...' : editingService ? 'Save Changes' : 'Create Service'}
-                      </motion.button>
-                    </div>
-                  </div>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
 
           {/* ===================== BOOKINGS TAB ===================== */}
           {activeTab === 'bookings' && (
@@ -1816,86 +1334,6 @@ const AdminDashboard = () => {
              </motion.div>
           )}
 
-          {/* ── BOOKING DETAIL MODAL ─────────────────────────── */}
-          <AnimatePresence>
-            {viewingBooking && (
-              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingBooking(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
-                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '500px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
-                    <div>
-                      <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Request Details</h3>
-                      <p style={{ color: 'var(--primary)', fontSize: '0.78rem', fontWeight: '700', marginTop: '0.2rem' }}>#{viewingBooking.id.slice(0, 8).toUpperCase()}</p>
-                    </div>
-                    <button onClick={() => setViewingBooking(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
-                  </div>
-
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem', padding: '1rem', background: 'rgba(59,130,246,0.06)', borderRadius: '14px', border: '1px solid rgba(59,130,246,0.15)' }}>
-                    <div>
-                      <div style={{ fontWeight: '900', fontSize: '1.1rem' }}>{viewingBooking.service_name}</div>
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>{viewingBooking.created_at ? new Date(viewingBooking.created_at).toLocaleString('en-PK') : '—'}</div>
-                    </div>
-                    <StatusBadge status={formatBookingStatus(viewingBooking.status)} />
-                  </div>
-
-                  {viewingBooking.image_url && (
-                    <div style={{ marginBottom: '1.2rem' }}>
-                      <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Photo</div>
-                      <a href={viewingBooking.image_url} target="_blank" rel="noopener noreferrer">
-                        <img src={viewingBooking.image_url} alt="Request" style={{ width: '100%', maxHeight: '220px', objectFit: 'cover', borderRadius: '14px', border: '1px solid var(--border)', display: 'block' }} />
-                      </a>
-                    </div>
-                  )}
-
-                  {[
-                    { label: 'Customer', value: viewingBooking.customer_name || '—' },
-                    { label: 'Phone', value: viewingBooking.customer_phone || '—' },
-                    { label: 'Provider', value: viewingBooking.providerName || 'Unassigned' },
-                    { label: 'Amount', value: viewingBooking.amount ? `RS ${Number(viewingBooking.amount).toLocaleString()}` : '—' },
-                    { label: 'City', value: viewingBooking.city || '—' },
-                    { label: 'Area', value: viewingBooking.area || '—' },
-                    { label: 'Address', value: viewingBooking.address || '—' },
-                  ].map(({ label, value }) => (
-                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.8rem 0', borderBottom: '1px solid var(--border)', gap: '1rem' }}>
-                      <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
-                      <span style={{ fontSize: '0.85rem', fontWeight: '800', textAlign: 'right', color: label === 'Provider' && !viewingBooking.providerName ? '#f59e0b' : 'inherit' }}>{value}</span>
-                    </div>
-                  ))}
-
-                  {/* Both parties' locations — customer's from the request itself,
-                      provider's from their registered provider_profiles row (joined
-                      in fetchBookings), since the request row's own provider_lat/lng
-                      is only ever live-tracking data from an active job, not a
-                      reliable "where are they based" location. */}
-                  <div style={{ display: 'flex', gap: '0.7rem', marginTop: '1.2rem' }}>
-                    <button
-                      disabled={!viewingBooking.latitude || !viewingBooking.longitude}
-                      onClick={() => setViewingLocationUser({ name: `${viewingBooking.customer_name || 'Customer'} (Customer)`, latitude: viewingBooking.latitude, longitude: viewingBooking.longitude })}
-                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '0.75rem', borderRadius: '100px', background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.3)', color: (viewingBooking.latitude && viewingBooking.longitude) ? 'var(--primary)' : 'var(--text-dim)', fontWeight: '700', fontSize: '0.8rem', cursor: (viewingBooking.latitude && viewingBooking.longitude) ? 'pointer' : 'not-allowed', opacity: (viewingBooking.latitude && viewingBooking.longitude) ? 1 : 0.5 }}
-                    >
-                      <MapPin size={14} /> Customer Location
-                    </button>
-                    <button
-                      disabled={!viewingBooking.providerLat || !viewingBooking.providerLng}
-                      onClick={() => setViewingLocationUser({ name: `${viewingBooking.providerName || 'Provider'} (Provider)`, latitude: viewingBooking.providerLat, longitude: viewingBooking.providerLng })}
-                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '0.75rem', borderRadius: '100px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', color: (viewingBooking.providerLat && viewingBooking.providerLng) ? '#10b981' : 'var(--text-dim)', fontWeight: '700', fontSize: '0.8rem', cursor: (viewingBooking.providerLat && viewingBooking.providerLng) ? 'pointer' : 'not-allowed', opacity: (viewingBooking.providerLat && viewingBooking.providerLng) ? 1 : 0.5 }}
-                    >
-                      <MapPin size={14} /> Provider Location
-                    </button>
-                  </div>
-
-                  {viewingBooking.description && (
-                    <div style={{ marginTop: '1.2rem', padding: '1rem', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', border: '1px solid var(--border)' }}>
-                      <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Problem Description</div>
-                      <p style={{ fontSize: '0.85rem', color: 'var(--text-dim)', lineHeight: '1.6', margin: 0 }}>{viewingBooking.description}</p>
-                    </div>
-                  )}
-
-                  <button onClick={() => setViewingBooking(null)} style={{ width: '100%', marginTop: '1.5rem', padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Close</button>
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
 
           {/* ===================== SERVICES TAB ===================== */}
           {activeTab === 'services' && (
@@ -2356,7 +1794,7 @@ const AdminDashboard = () => {
                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
                       
                       {/* CMS Tabs Navigation */}
-                      <div style={{ display: 'flex', background: 'rgba(255,255,255,0.05)', padding: '0.4rem', borderRadius: '12px', gap: '0.5rem', overflowX: 'auto' }}>
+                      <div className="chip-row" style={{ display: 'flex', background: 'rgba(255,255,255,0.05)', padding: '0.4rem', borderRadius: '12px', gap: '0.5rem', overflowX: 'auto' }}>
                          {['home', 'services', 'about', 'contact', 'footer'].map(tab => (
                             <button
                                key={tab}
@@ -2899,6 +2337,615 @@ const AdminDashboard = () => {
           )}
 
         </AnimatePresence>
+
+        {/* modals live outside the tab switcher so they never fight its animation */}
+          {/* ── EDIT USER MODAL ────────────────────────────────── */}
+          <AnimatePresence>
+            {editingUser && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setEditingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '440px', zIndex: 1 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
+                    <div>
+                      <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Edit User</h3>
+                      <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.2rem' }}>{editingUser.email}</p>
+                    </div>
+                    <button onClick={() => setEditingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
+                    <div>
+                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Full Name</label>
+                      <input className="input-minimal" value={editForm.name} onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))} placeholder="Full name" />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Phone</label>
+                      <input className="input-minimal" value={editForm.phone} onChange={e => setEditForm(f => ({ ...f, phone: e.target.value }))} placeholder="03XXXXXXXXX" />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Role</label>
+                      <select className="input-minimal" value={editForm.role} onChange={e => setEditForm(f => ({ ...f, role: e.target.value }))}>
+                        <option value="user">Customer</option>
+                        <option value="provider">Provider</option>
+                        <option value="admin">Admin</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase' }}>Address</label>
+                      <input className="input-minimal" value={editForm.address || ''} onChange={e => setEditForm(f => ({ ...f, address: e.target.value }))} placeholder="Full address" />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: '1px solid var(--border)' }}>
+                      <input type="checkbox" id="isVerified" checked={editForm.isVerified} onChange={e => setEditForm(f => ({ ...f, isVerified: e.target.checked }))} style={{ width: '18px', height: '18px', accentColor: 'var(--primary)' }} />
+                      <label htmlFor="isVerified" style={{ fontWeight: '700', cursor: 'pointer' }}>Email Verified</label>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '1rem', marginTop: '1.8rem' }}>
+                    <button onClick={() => setEditingUser(null)} style={{ flex: 1, padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Cancel</button>
+                    <motion.button whileHover={{ scale: 1.02 }} onClick={handleEditSave} disabled={editSaving} style={{ flex: 2, padding: '1rem', borderRadius: '100px', background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)', border: 'none', color: 'white', fontWeight: '800', cursor: 'pointer', opacity: editSaving ? 0.7 : 1 }}>
+                      {editSaving ? 'Saving...' : 'Save Changes'}
+                    </motion.button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          {/* ── VIEW USER MODAL ────────────────────────────────── */}
+          <AnimatePresence>
+            {viewingUser && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '480px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
+                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>{viewingUser.role === 'provider' ? 'Provider Details' : 'User Details'}</h3>
+                    <button onClick={() => setViewingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
+                  </div>
+
+                  {/* Avatar + Name */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1.8rem', padding: '1.2rem', background: viewingUser.role === 'provider' ? 'rgba(16,185,129,0.06)' : 'rgba(59,130,246,0.06)', borderRadius: '16px', border: `1px solid ${viewingUser.role === 'provider' ? 'rgba(16,185,129,0.2)' : 'rgba(59,130,246,0.15)'}` }}>
+                    <div style={{ width: '56px', height: '56px', borderRadius: '50%', background: viewingUser.avatarUrl ? `url(${viewingUser.avatarUrl}) center/cover` : (viewingUser.role === 'provider' ? 'linear-gradient(135deg, #10b981, #059669)' : 'linear-gradient(135deg, #3b82f6, #8b5cf6)'), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '900', fontSize: '1.3rem', flexShrink: 0 }}>
+                      {!viewingUser.avatarUrl && (viewingUser.name || '?').charAt(0).toUpperCase()}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: '900', fontSize: '1.1rem' }}>{viewingUser.name}</div>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{viewingUser.email}</div>
+                      {viewingUser.role === 'provider' && providerProfile?.online_now !== undefined && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginTop: '4px' }}>
+                          <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: providerProfile.online_now ? '#10b981' : '#6b7280' }} />
+                          <span style={{ fontSize: '0.72rem', color: providerProfile.online_now ? '#10b981' : 'var(--text-dim)', fontWeight: '700' }}>{providerProfile.online_now ? 'Online' : 'Offline'}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* ── Basic Info ── */}
+                  {[
+                    { label: 'Role', value: viewingUser.role === 'user' ? 'Customer' : viewingUser.role, cap: true },
+                    { label: 'Email', value: viewingUser.email || 'Not set' },
+                    { label: 'Phone', value: viewingUser.phone || 'Not set' },
+                    { label: 'City', value: viewingUser.city || 'Not set' },
+                    { label: 'Area', value: viewingUser.area || 'Not set' },
+                    { label: 'Address', value: viewingUser.address || 'Not set' },
+                    { label: 'Status', value: viewingUser.isVerified ? '✓ Verified' : '⏳ Pending Approval' },
+                    { label: 'Joined', value: viewingUser.createdAt ? new Date(viewingUser.createdAt).toLocaleString('en-PK', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—' },
+                  ].map(({ label, value, cap }) => (
+                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.8rem 0', borderBottom: '1px solid var(--border)' }}>
+                      <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700' }}>{label}</span>
+                      <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', color: label === 'Status' ? (viewingUser.isVerified ? '#10b981' : '#f59e0b') : 'inherit' }}>{value}</span>
+                    </div>
+                  ))}
+
+                  {/* ── Provider Profile Section ── */}
+                  {viewingUser.role === 'provider' && (
+                    <div style={{ marginTop: '1.5rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '1rem', paddingBottom: '0.6rem', borderBottom: '2px solid rgba(16,185,129,0.25)' }}>
+                        <Briefcase size={16} color="#10b981" />
+                        <span style={{ fontWeight: '900', fontSize: '0.9rem', color: '#10b981', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Provider Profile</span>
+                      </div>
+
+                      {providerLoading ? (
+                        <div style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading profile...</div>
+                      ) : !providerProfile ? (
+                        <div style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)', fontSize: '0.85rem', fontStyle: 'italic' }}>No provider profile found.</div>
+                      ) : (
+                        <>
+                          {/* Stats Row */}
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.8rem', marginBottom: '1rem' }}>
+                            {[
+                              { label: 'Rating', value: providerProfile.rating != null ? `${Number(providerProfile.rating).toFixed(1)} ★` : '—', color: '#f59e0b' },
+                              { label: 'Jobs Done', value: providerProfile.total_jobs ?? '0', color: '#3b82f6' },
+                              { label: 'Rate/hr', value: providerProfile.rate_per_hour ? `Rs ${providerProfile.rate_per_hour}` : '—', color: '#8b5cf6' },
+                            ].map(({ label, value, color }) => (
+                              <div key={label} style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', borderRadius: '12px', padding: '0.8rem', textAlign: 'center' }}>
+                                <div style={{ fontSize: '1.05rem', fontWeight: '900', color }}>{value}</div>
+                                <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', fontWeight: '700', marginTop: '2px' }}>{label}</div>
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* Field List */}
+                          {[
+                            { label: 'Service Type', value: providerProfile.service_type || '—', cap: true },
+                            { label: 'CNIC', value: providerProfile.cnic || '—' },
+                            { label: 'Experience', value: providerProfile.experience || '—' },
+                            { label: 'Skills', value: Array.isArray(providerProfile.skills) && providerProfile.skills.length ? providerProfile.skills.join(', ') : (typeof providerProfile.skills === 'string' && providerProfile.skills ? providerProfile.skills : '—') },
+                          ].map(({ label, value, cap }) => (
+                            <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '0.75rem 0', borderBottom: '1px solid var(--border)', gap: '1rem' }}>
+                              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
+                              <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', textAlign: 'right', wordBreak: 'break-word' }}>{value}</span>
+                            </div>
+                          ))}
+
+                          {/* About */}
+                          {providerProfile.about && (
+                            <div style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', border: '1px solid var(--border)' }}>
+                              <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>About</div>
+                              <p style={{ fontSize: '0.85rem', color: 'var(--text-dim)', lineHeight: '1.6', margin: 0 }}>{providerProfile.about}</p>
+                            </div>
+                          )}
+
+                          {/* KYC Documents — must be visible before approving, otherwise
+                              approval happens blind without ever seeing the actual ID/selfie. */}
+                          <div style={{ marginTop: '1.2rem' }}>
+                            <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.6rem' }}>KYC Documents</div>
+                            {[
+                              { label: 'CNIC Front', url: providerProfile.cnic_front_url },
+                              { label: 'CNIC Back', url: providerProfile.cnic_back_url },
+                              { label: 'Selfie with ID', url: providerProfile.selfie_url },
+                              { label: 'Work Portfolio', url: providerProfile.portfolio_url },
+                              { label: 'Certificates', url: providerProfile.certificates_url },
+                            ].every(d => !d.url) ? (
+                              <div style={{ padding: '0.9rem', borderRadius: '12px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', color: '#f59e0b', fontSize: '0.8rem', fontWeight: '700' }}>
+                                No KYC documents were uploaded — do not approve without verifying identity another way.
+                              </div>
+                            ) : (
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.7rem' }}>
+                                {[
+                                  { label: 'CNIC Front', url: providerProfile.cnic_front_url },
+                                  { label: 'CNIC Back', url: providerProfile.cnic_back_url },
+                                  { label: 'Selfie with ID', url: providerProfile.selfie_url },
+                                  { label: 'Work Portfolio', url: providerProfile.portfolio_url },
+                                  { label: 'Certificates', url: providerProfile.certificates_url },
+                                ].map(({ label, url }) => (
+                                  <a
+                                    key={label}
+                                    href={url || undefined}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={{
+                                      display: 'flex', flexDirection: 'column', gap: '0.4rem',
+                                      borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--border)',
+                                      background: 'rgba(255,255,255,0.02)', textDecoration: 'none',
+                                      pointerEvents: url ? 'auto' : 'none', opacity: url ? 1 : 0.4,
+                                    }}
+                                  >
+                                    {url ? (
+                                      <img src={url} alt={label} style={{ width: '100%', height: '90px', objectFit: 'cover', display: 'block' }} />
+                                    ) : (
+                                      <div style={{ width: '100%', height: '90px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: '0.7rem' }}>Not uploaded</div>
+                                    )}
+                                    <span style={{ fontSize: '0.7rem', fontWeight: '700', color: 'var(--text-muted)', padding: '0 0.6rem 0.6rem' }}>{label}</span>
+                                  </a>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── Action Buttons ── */}
+                  <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
+                    {viewingUser.role === 'provider' && !viewingUser.isVerified && (<>
+                      <button
+                        onClick={() => handleApproveProvider(viewingUser)}
+                        style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(16,185,129,0.15)', border: '1px solid rgba(16,185,129,0.4)', color: '#10b981', fontWeight: '800', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+                      >
+                        <CheckCircle size={16} /> APPROVE PROVIDER
+                      </button>
+                      <button
+                        onClick={() => handleRejectProvider(viewingUser)}
+                        style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', color: '#f59e0b', fontWeight: '800', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+                      >
+                        <X size={16} /> REJECT (delete account, they re-register)
+                      </button>
+                    </>)}
+                    <button onClick={() => { handleDeleteUser(viewingUser); setViewingUser(null); }} style={{ width: '100%', padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}>Delete User</button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          <AnimatePresence>
+            {viewingLocationUser && (
+              <UserLocationModal user={viewingLocationUser} onClose={() => setViewingLocationUser(null)} />
+            )}
+          </AnimatePresence>
+
+          {/* ── REJECTED APPLICATIONS LOG ─────────────────────────── */}
+          <AnimatePresence>
+            {showRejectedLog && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { setShowRejectedLog(false); setViewingRejected(null); }} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: viewingRejected ? '480px' : '760px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>
+                      {viewingRejected ? 'Rejected Application' : 'Rejected Applications'}
+                    </h3>
+                    <button
+                      onClick={() => viewingRejected ? setViewingRejected(null) : (() => { setShowRejectedLog(false); setViewingRejected(null); })()}
+                      style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}
+                    ><X size={18} /></button>
+                  </div>
+
+                  {viewingRejected ? (
+                    <>
+                      <div style={{ padding: '0.9rem 1.1rem', borderRadius: '14px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', marginBottom: '1.2rem' }}>
+                        <div style={{ fontSize: '0.72rem', fontWeight: '800', color: '#ef4444', textTransform: 'uppercase', marginBottom: '0.3rem' }}>Rejection Reason</div>
+                        <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>{viewingRejected.rejection_reason}</div>
+                      </div>
+
+                      {[
+                        { label: 'Name', value: viewingRejected.name || '—' },
+                        { label: 'Email', value: viewingRejected.email || '—' },
+                        { label: 'Phone', value: viewingRejected.phone || '—' },
+                        { label: 'City', value: viewingRejected.city || '—' },
+                        { label: 'Area', value: viewingRejected.area || '—' },
+                        { label: 'Address', value: viewingRejected.address || '—' },
+                        { label: 'CNIC', value: viewingRejected.cnic || '—' },
+                        { label: 'Service Type', value: viewingRejected.service_type || '—', cap: true },
+                        { label: 'Experience', value: viewingRejected.experience || '—' },
+                        { label: 'Skills', value: Array.isArray(viewingRejected.skills) && viewingRejected.skills.length ? viewingRejected.skills.join(', ') : '—' },
+                        { label: 'Rejected At', value: viewingRejected.rejected_at ? new Date(viewingRejected.rejected_at).toLocaleString('en-PK', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—' },
+                      ].map(({ label, value, cap }) => (
+                        <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', padding: '0.75rem 0', borderBottom: '1px solid var(--border)' }}>
+                          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
+                          <span style={{ fontSize: '0.85rem', fontWeight: '800', textTransform: cap ? 'capitalize' : 'none', textAlign: 'right', wordBreak: 'break-word' }}>{value}</span>
+                        </div>
+                      ))}
+
+                      {(viewingRejected.cnic_front_url || viewingRejected.cnic_back_url || viewingRejected.selfie_url || viewingRejected.portfolio_url || viewingRejected.certificates_url) && (
+                        <div style={{ marginTop: '1.2rem' }}>
+                          <div style={{ fontSize: '0.75rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.7rem' }}>KYC Documents</div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.7rem' }}>
+                            {[
+                              { label: 'CNIC Front', url: viewingRejected.cnic_front_url },
+                              { label: 'CNIC Back', url: viewingRejected.cnic_back_url },
+                              { label: 'Selfie', url: viewingRejected.selfie_url },
+                              { label: 'Portfolio', url: viewingRejected.portfolio_url },
+                              { label: 'Certificates', url: viewingRejected.certificates_url },
+                            ].filter(d => d.url).map(d => (
+                              <a key={d.label} href={d.url} target="_blank" rel="noreferrer" style={{ display: 'block', borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--border)' }}>
+                                <img src={d.url} alt={d.label} style={{ width: '100%', height: '90px', objectFit: 'cover', display: 'block' }} />
+                                <div style={{ padding: '0.4rem 0.6rem', fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: '700' }}>{d.label}</div>
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <button
+                        onClick={() => handleDeleteRejectedLog(viewingRejected.id)}
+                        style={{ width: '100%', marginTop: '1.5rem', padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}
+                      >Delete Log Entry</button>
+                    </>
+                  ) : rejectedLoading ? (
+                    <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>Loading...</div>
+                  ) : rejectedApplications.length === 0 ? (
+                    <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>No rejected applications on record.</div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                      {rejectedApplications.map(r => (
+                        <div key={r.id} onClick={() => setViewingRejected(r)} style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', borderRadius: '14px', background: 'rgba(239,68,68,0.04)', border: '1px solid rgba(239,68,68,0.15)', cursor: 'pointer' }}>
+                          <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: 'linear-gradient(135deg, #ef4444, #b91c1c)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '800', fontSize: '0.9rem', flexShrink: 0 }}>
+                            {(r.name || '?').charAt(0).toUpperCase()}
+                          </div>
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{ fontWeight: '800', fontSize: '0.9rem' }}>{r.name || 'Unknown'}</div>
+                            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.email}</div>
+                            <div style={{ fontSize: '0.75rem', color: '#ef4444', marginTop: '0.2rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.rejection_reason}</div>
+                          </div>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', flexShrink: 0 }}>
+                            {r.rejected_at ? new Date(r.rejected_at).toLocaleDateString('en-PK', { day: 'numeric', month: 'short' }) : ''}
+                          </div>
+                          <ChevronRight size={16} color="var(--text-dim)" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          {/* ── CONTACT MESSAGE DETAIL MODAL ─────────────────────────── */}
+          <AnimatePresence>
+            {viewingContact && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingContact(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '480px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                    <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Message Details</h3>
+                    <button onClick={() => setViewingContact(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1.2rem' }}>
+                    {viewingContact.sender_role && (
+                      <span style={{
+                        padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', textTransform: 'capitalize',
+                        background: viewingContact.sender_role === 'provider' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(59, 130, 246, 0.12)',
+                        color: viewingContact.sender_role === 'provider' ? '#10b981' : 'var(--primary)',
+                      }}>
+                        {viewingContact.sender_role}
+                      </span>
+                    )}
+                    {viewingContact.sender_specialization && (
+                      <span style={{ padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', background: 'rgba(245, 158, 11, 0.12)', color: '#f59e0b' }}>
+                        {viewingContact.sender_specialization}
+                      </span>
+                    )}
+                    {!viewingContact.sender_role && (
+                      <span style={{ padding: '5px 12px', borderRadius: '100px', fontSize: '0.72rem', fontWeight: '800', background: 'rgba(255,255,255,0.05)', color: 'var(--text-dim)' }}>
+                        Guest (not logged in)
+                      </span>
+                    )}
+                    <StatusBadge status={viewingContact.status === 'resolved' ? 'Completed' : 'Pending'} />
+                  </div>
+
+                  {[
+                    { label: 'Name', value: viewingContact.name || '—' },
+                    { label: 'Email', value: viewingContact.email || '—' },
+                    { label: 'Phone', value: viewingContact.phone || '—' },
+                    { label: 'Subject', value: viewingContact.subject || '—' },
+                    { label: 'Received', value: new Date(viewingContact.created_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) },
+                  ].map((row, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.7rem 0', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                      <span style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{row.label}</span>
+                      <span style={{ fontWeight: '700', fontSize: '0.85rem', textAlign: 'right' }}>{row.value}</span>
+                    </div>
+                  ))}
+
+                  <div style={{ marginTop: '1rem' }}>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.72rem', fontWeight: '800', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Message</div>
+                    <div style={{ padding: '1rem', borderRadius: '14px', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', fontSize: '0.85rem', lineHeight: '1.6', color: 'var(--text-muted)', whiteSpace: 'pre-wrap' }}>
+                      {viewingContact.message}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.8rem', marginTop: '1.8rem' }}>
+                    {viewingContact.status === 'resolved' ? (
+                      <button onClick={() => handleMarkContactResolved(viewingContact.id, 'new')} style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(255,255,255,0.05)', border: '1px solid var(--border)', color: 'white', fontWeight: '800', cursor: 'pointer' }}>Mark as New</button>
+                    ) : (
+                      <button onClick={() => handleMarkContactResolved(viewingContact.id, 'resolved')} style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', color: '#10b981', fontWeight: '800', cursor: 'pointer' }}>Mark Resolved</button>
+                    )}
+                    <button onClick={() => handleDeleteContactMessage(viewingContact.id)} style={{ padding: '0.9rem 1.2rem', borderRadius: '100px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', fontWeight: '800', cursor: 'pointer' }}><Trash2 size={16} /></button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          {/* ── REJECT PROVIDER MODAL ─────────────────────────────── */}
+          <AnimatePresence>
+            {rejectingUser && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => !rejectSubmitting && setRejectingUser(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '440px', zIndex: 1 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                    <h3 style={{ fontWeight: '900', fontSize: '1.15rem' }}>Reject {rejectingUser.name}</h3>
+                    <button onClick={() => !rejectSubmitting && setRejectingUser(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
+                  </div>
+                  <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: '1.6', marginBottom: '1.2rem' }}>
+                    Their account will be deleted and this reason logged. They'll see it on their app and can register again with the same email.
+                  </p>
+                  <label style={{ fontSize: '0.7rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem', display: 'block' }}>Reason for Rejection</label>
+                  <textarea
+                    autoFocus
+                    value={rejectReasonInput}
+                    onChange={e => setRejectReasonInput(e.target.value)}
+                    placeholder="e.g. CNIC photo doesn't match selfie"
+                    rows={4}
+                    style={{ width: '100%', padding: '0.9rem', borderRadius: '14px', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border)', color: 'white', fontSize: '0.9rem', fontFamily: 'inherit', resize: 'vertical', marginBottom: '1.5rem' }}
+                  />
+                  <div style={{ display: 'flex', gap: '0.8rem' }}>
+                    <button
+                      onClick={() => setRejectingUser(null)}
+                      disabled={rejectSubmitting}
+                      style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(255,255,255,0.05)', border: '1px solid var(--border)', color: 'white', fontWeight: '800', cursor: rejectSubmitting ? 'not-allowed' : 'pointer' }}
+                    >Cancel</button>
+                    <button
+                      onClick={confirmRejectProvider}
+                      disabled={rejectSubmitting || !rejectReasonInput.trim()}
+                      style={{ flex: 1, padding: '0.9rem', borderRadius: '100px', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#ef4444', fontWeight: '800', cursor: (rejectSubmitting || !rejectReasonInput.trim()) ? 'not-allowed' : 'pointer', opacity: (rejectSubmitting || !rejectReasonInput.trim()) ? 0.5 : 1 }}
+                    >{rejectSubmitting ? 'Rejecting...' : 'Reject & Delete'}</button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          {/* ── SERVICE CREATE/EDIT MODAL ─────────────────────────── */}
+          <AnimatePresence>
+            {showServiceModal && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowServiceModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', width: '100%', maxWidth: '540px', zIndex: 1, maxHeight: '92vh', overflowY: 'auto' }}>
+
+                  {/* Image Banner */}
+                  <div style={{ height: '160px', position: 'relative', borderRadius: '28px 28px 0 0', overflow: 'hidden', background: serviceImgPreview ? 'transparent' : `linear-gradient(135deg, ${serviceForm.color}30, ${serviceForm.color}08)`, cursor: 'pointer' }} onClick={() => document.getElementById('svc-img-input').click()}>
+                    {serviceImgPreview
+                      ? <img src={serviceImgPreview} alt="preview" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      : <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
+                          <div style={{ color: serviceForm.color, opacity: 0.4, transform: 'scale(3.5)', marginBottom: '0.5rem' }}>{SERVICE_ICONS[serviceForm.icon] || SERVICE_ICONS.Sparkles}</div>
+                        </div>
+                    }
+                    <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', color: 'white', fontWeight: '800', fontSize: '0.85rem' }}>
+                      <ImageIcon size={18} /> {serviceImgPreview ? 'Click to change image' : 'Click to upload image'}
+                    </div>
+                    <input id="svc-img-input" type="file" accept="image/*" style={{ display: 'none' }} onChange={handleServiceImgPick} />
+                    {/* Floating icon badge */}
+                    <div style={{ position: 'absolute', bottom: '-20px', left: '24px', color: serviceForm.color, background: '#0f0f0f', border: `2px solid ${serviceForm.color}40`, width: '48px', height: '48px', borderRadius: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 16px rgba(0,0,0,0.4)' }}>
+                      {SERVICE_ICONS[serviceForm.icon] || SERVICE_ICONS.Sparkles}
+                    </div>
+                  </div>
+
+                  <div style={{ padding: '2rem', paddingTop: '2.8rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.8rem' }}>
+                      <div>
+                        <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>{editingService ? 'Edit Service' : 'Create New Service'}</h3>
+                        <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginTop: '0.2rem' }}>Visible on web app, mobile app, and provider registration.</p>
+                      </div>
+                      <button onClick={() => setShowServiceModal(false)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer', flexShrink: 0 }}><X size={18} /></button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
+                      {/* Name */}
+                      <div>
+                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Service Name *</label>
+                        <input className="input-minimal" value={serviceForm.name} onChange={e => setServiceForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. AC Repair, Deep Cleaning" />
+                      </div>
+
+                      {/* Icon + Color */}
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                        <div>
+                          <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Icon</label>
+                          <select className="input-minimal" value={serviceForm.icon} onChange={e => setServiceForm(f => ({ ...f, icon: e.target.value }))}>
+                            {ICON_NAMES.map(n => <option key={n} value={n}>{n}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Theme Color</label>
+                          <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
+                            <input type="color" value={serviceForm.color} onChange={e => setServiceForm(f => ({ ...f, color: e.target.value }))} style={{ width: '44px', height: '44px', border: 'none', borderRadius: '10px', cursor: 'pointer', background: 'none', flexShrink: 0 }} />
+                            <input className="input-minimal" value={serviceForm.color} onChange={e => setServiceForm(f => ({ ...f, color: e.target.value }))} placeholder="#3b82f6" style={{ flex: 1 }} />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Starting Price (RS)</label>
+                        <input className="input-minimal" type="number" min="0" value={serviceForm.startingPrice} onChange={e => setServiceForm(f => ({ ...f, startingPrice: e.target.value }))} placeholder="e.g. 500" />
+                      </div>
+
+                      {/* Description */}
+                      <div>
+                        <label style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', display: 'block', marginBottom: '0.4rem', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Description</label>
+                        <textarea className="input-minimal" rows={3} value={serviceForm.description} onChange={e => setServiceForm(f => ({ ...f, description: e.target.value }))} placeholder="Brief description shown on the services page..." style={{ resize: 'none' }} />
+                      </div>
+
+                      {/* Active toggle */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '0.9rem 1rem', background: serviceForm.isActive ? 'rgba(16,185,129,0.06)' : 'rgba(239,68,68,0.06)', borderRadius: '14px', border: `1px solid ${serviceForm.isActive ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)'}`, cursor: 'pointer' }} onClick={() => setServiceForm(f => ({ ...f, isActive: !f.isActive }))}>
+                        {serviceForm.isActive ? <ToggleRight size={24} color="#10b981" /> : <ToggleLeft size={24} color="#ef4444" />}
+                        <div>
+                          <div style={{ fontWeight: '800', fontSize: '0.9rem', color: serviceForm.isActive ? '#10b981' : '#ef4444' }}>
+                            {serviceForm.isActive ? 'Active' : 'Disabled'}
+                          </div>
+                          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                            {serviceForm.isActive ? 'Visible to customers and providers' : 'Hidden from all users'}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {serviceError && (
+                      <div style={{ marginTop: '1rem', padding: '0.9rem 1rem', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '12px', color: '#ef4444', fontSize: '0.82rem', fontWeight: '600', lineHeight: '1.5' }}>
+                        ⚠ {serviceError}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: '1rem', marginTop: '1.2rem' }}>
+                      <button onClick={() => setShowServiceModal(false)} style={{ flex: 1, padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Cancel</button>
+                      <motion.button whileHover={{ scale: 1.02 }} onClick={handleServiceSave} disabled={serviceSaving || !serviceForm.name.trim()} style={{ flex: 2, padding: '1rem', borderRadius: '100px', background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)', border: 'none', color: 'white', fontWeight: '800', cursor: 'pointer', opacity: (serviceSaving || !serviceForm.name.trim()) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
+                        <Save size={16} /> {serviceImgUploading ? 'Uploading...' : serviceSaving ? 'Saving...' : editingService ? 'Save Changes' : 'Create Service'}
+                      </motion.button>
+                    </div>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+          {/* ── BOOKING DETAIL MODAL ─────────────────────────── */}
+          <AnimatePresence>
+            {viewingBooking && (
+              <div style={{ position: 'fixed', inset: 0, zIndex: 3000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setViewingBooking(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)' }} />
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} style={{ position: 'relative', background: '#0f0f0f', border: '1px solid var(--border)', borderRadius: '28px', padding: '2rem', width: '100%', maxWidth: '500px', zIndex: 1, maxHeight: '90vh', overflowY: 'auto' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.8rem' }}>
+                    <div>
+                      <h3 style={{ fontWeight: '900', fontSize: '1.2rem' }}>Request Details</h3>
+                      <p style={{ color: 'var(--primary)', fontSize: '0.78rem', fontWeight: '700', marginTop: '0.2rem' }}>#{viewingBooking.id.slice(0, 8).toUpperCase()}</p>
+                    </div>
+                    <button onClick={() => setViewingBooking(null)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', padding: '8px', borderRadius: '10px', cursor: 'pointer' }}><X size={18} /></button>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem', padding: '1rem', background: 'rgba(59,130,246,0.06)', borderRadius: '14px', border: '1px solid rgba(59,130,246,0.15)' }}>
+                    <div>
+                      <div style={{ fontWeight: '900', fontSize: '1.1rem' }}>{viewingBooking.service_name}</div>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>{viewingBooking.created_at ? new Date(viewingBooking.created_at).toLocaleString('en-PK') : '—'}</div>
+                    </div>
+                    <StatusBadge status={formatBookingStatus(viewingBooking.status)} />
+                  </div>
+
+                  {viewingBooking.image_url && (
+                    <div style={{ marginBottom: '1.2rem' }}>
+                      <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Photo</div>
+                      <a href={viewingBooking.image_url} target="_blank" rel="noopener noreferrer">
+                        <img src={viewingBooking.image_url} alt="Request" style={{ width: '100%', maxHeight: '220px', objectFit: 'cover', borderRadius: '14px', border: '1px solid var(--border)', display: 'block' }} />
+                      </a>
+                    </div>
+                  )}
+
+                  {[
+                    { label: 'Customer', value: viewingBooking.customer_name || '—' },
+                    { label: 'Phone', value: viewingBooking.customer_phone || '—' },
+                    { label: 'Provider', value: viewingBooking.providerName || 'Unassigned' },
+                    { label: 'Amount', value: viewingBooking.amount ? `RS ${Number(viewingBooking.amount).toLocaleString()}` : '—' },
+                    { label: 'City', value: viewingBooking.city || '—' },
+                    { label: 'Area', value: viewingBooking.area || '—' },
+                    { label: 'Address', value: viewingBooking.address || '—' },
+                  ].map(({ label, value }) => (
+                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.8rem 0', borderBottom: '1px solid var(--border)', gap: '1rem' }}>
+                      <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontWeight: '700', flexShrink: 0 }}>{label}</span>
+                      <span style={{ fontSize: '0.85rem', fontWeight: '800', textAlign: 'right', color: label === 'Provider' && !viewingBooking.providerName ? '#f59e0b' : 'inherit' }}>{value}</span>
+                    </div>
+                  ))}
+
+                  {/* Both parties' locations — customer's from the request itself,
+                      provider's from their registered provider_profiles row (joined
+                      in fetchBookings), since the request row's own provider_lat/lng
+                      is only ever live-tracking data from an active job, not a
+                      reliable "where are they based" location. */}
+                  <div style={{ display: 'flex', gap: '0.7rem', marginTop: '1.2rem' }}>
+                    <button
+                      disabled={!viewingBooking.latitude || !viewingBooking.longitude}
+                      onClick={() => setViewingLocationUser({ name: `${viewingBooking.customer_name || 'Customer'} (Customer)`, latitude: viewingBooking.latitude, longitude: viewingBooking.longitude })}
+                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '0.75rem', borderRadius: '100px', background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.3)', color: (viewingBooking.latitude && viewingBooking.longitude) ? 'var(--primary)' : 'var(--text-dim)', fontWeight: '700', fontSize: '0.8rem', cursor: (viewingBooking.latitude && viewingBooking.longitude) ? 'pointer' : 'not-allowed', opacity: (viewingBooking.latitude && viewingBooking.longitude) ? 1 : 0.5 }}
+                    >
+                      <MapPin size={14} /> Customer Location
+                    </button>
+                    <button
+                      disabled={!viewingBooking.providerLat || !viewingBooking.providerLng}
+                      onClick={() => setViewingLocationUser({ name: `${viewingBooking.providerName || 'Provider'} (Provider)`, latitude: viewingBooking.providerLat, longitude: viewingBooking.providerLng })}
+                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '0.75rem', borderRadius: '100px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', color: (viewingBooking.providerLat && viewingBooking.providerLng) ? '#10b981' : 'var(--text-dim)', fontWeight: '700', fontSize: '0.8rem', cursor: (viewingBooking.providerLat && viewingBooking.providerLng) ? 'pointer' : 'not-allowed', opacity: (viewingBooking.providerLat && viewingBooking.providerLng) ? 1 : 0.5 }}
+                    >
+                      <MapPin size={14} /> Provider Location
+                    </button>
+                  </div>
+
+                  {viewingBooking.description && (
+                    <div style={{ marginTop: '1.2rem', padding: '1rem', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', border: '1px solid var(--border)' }}>
+                      <div style={{ fontSize: '0.72rem', fontWeight: '800', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Problem Description</div>
+                      <p style={{ fontSize: '0.85rem', color: 'var(--text-dim)', lineHeight: '1.6', margin: 0 }}>{viewingBooking.description}</p>
+                    </div>
+                  )}
+
+                  <button onClick={() => setViewingBooking(null)} style={{ width: '100%', marginTop: '1.5rem', padding: '1rem', borderRadius: '100px', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'white', fontWeight: '700', cursor: 'pointer' }}>Close</button>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
         </div>
       </div>
     </div>

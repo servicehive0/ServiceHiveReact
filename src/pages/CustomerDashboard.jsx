@@ -31,7 +31,6 @@ import { StatsStrip } from '../components/ui/StatsStrip';
 import { StatusChip, requestStatusMeta } from '../components/ui/StatusChip';
 import { ServiceGridCard } from '../components/ui/ServiceGridCard';
 import { rankAndScoreBidsML, distanceKm } from '../lib/aiInsights';
-import { notify } from '../lib/notify';
 import { PromoCarousel } from '../components/ui/PromoCarousel';
 import { DashboardBottomNav } from '../components/ui/DashboardBottomNav';
 import { DashboardSidebar } from '../components/ui/DashboardSidebar';
@@ -101,7 +100,7 @@ const PostRequestModal = ({ user, onClose, onPosted, initialService, targetProvi
       setError('Please fill all required fields.'); return;
     }
     setLoading(true); setError('');
-    const { data: created, error: err } = await supabase.from('service_requests').insert({
+    const { error: err } = await supabase.from('service_requests').insert({
       customer_id: user.id,
       customer_name: user.name,
       customer_phone: user.phone || '',
@@ -111,27 +110,12 @@ const PostRequestModal = ({ user, onClose, onPosted, initialService, targetProvi
       area: form.area,
       address: form.address,
       status: 'open',
+      target_provider_id: targetProvider?.id || null,
     }).select('id').single();
     setLoading(false);
     if (err) { setError(err.message); return; }
 
-    // Best-effort: notify the target provider directly ("Send Request" from
-    // their profile), or otherwise every online provider of this service
-    // type in the customer's city so they see the new request without
-    // polling — the request row itself is identical either way; only who
-    // gets notified differs.
-    try {
-      if (targetProvider) {
-        await notify(targetProvider.id, 'New request just for you',
-          `${user.name} wants to book you directly for ${form.service_name}`, 'booking', { requestId: created?.id });
-      } else {
-        const { data: providers } = await supabase.from('provider_profiles')
-          .select('id').eq('service_type', form.service_name).eq('is_online', true);
-        await Promise.all((providers || []).map(p =>
-          notify(p.id, 'New service request nearby', `${form.service_name} needed in ${form.area}, ${form.city}`, 'booking', { requestId: created?.id })));
-      }
-    } catch { /* non-critical */ }
-
+    // the database tells the right providers about the new request (see notify_new_request)
     onPosted();
   };
 
@@ -210,7 +194,6 @@ const PostRequestModal = ({ user, onClose, onPosted, initialService, targetProvi
 };
 
 // ── Bids Modal ────────────────────────────────────────────────────────────────
-const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
 const BidsModal = ({ request, onClose, onAccepted }) => {
   const [bids, setBids] = useState([]);
@@ -251,9 +234,14 @@ const BidsModal = ({ request, onClose, onAccepted }) => {
     let cancelled = false;
     (async () => {
       const providerIds = bids.map(b => b.provider_id);
-      const { data: profiles } = await supabase.from('provider_profiles').select('*').in('id', providerIds);
+      // the location is on the users row, rating/jobs on provider_profiles
+      const { data: rows } = await supabase.from('users')
+        .select('id, latitude, longitude, provider_profiles(rating, total_jobs, experience)').in('id', providerIds);
       const profileById = {};
-      (profiles || []).forEach(p => { profileById[p.id] = p; });
+      (rows || []).forEach(r => {
+        const pp = Array.isArray(r.provider_profiles) ? r.provider_profiles[0] : r.provider_profiles;
+        profileById[r.id] = { ...(pp || {}), latitude: r.latitude, longitude: r.longitude };
+      });
 
       const enriched = bids.map(b => {
         const p = profileById[b.provider_id] || {};
@@ -276,43 +264,14 @@ const BidsModal = ({ request, onClose, onAccepted }) => {
 
   const acceptBid = async (bid) => {
     setAccepting(bid.id);
-    const otp = generateOtp();
-
-    await supabase.from('service_requests').update({
-      status: 'accepted',
-      accepted_bid_id: bid.id,
-      accepted_provider_id: bid.provider_id,
-      otp_code: otp,
-    }).eq('id', request.id);
-
-    await supabase.from('bids').update({ status: 'accepted' }).eq('id', bid.id);
-    await supabase.from('bids').update({ status: 'rejected' }).eq('request_id', request.id).neq('id', bid.id);
-
-    // Mirror Flutter's acceptBid(): also create a bookings row so this
-    // shows up in the shared bookings list/history (non-critical, best-effort).
-    try {
-      let serviceIcon = 'Wrench';
-      const { data: svc } = await supabase.from('services').select('icon').ilike('name', request.service_name || '').maybeSingle();
-      if (svc?.icon) serviceIcon = svc.icon;
-
-      await supabase.from('bookings').insert({
-        request_id: request.id,
-        user_id: request.customer_id,
-        provider_id: bid.provider_id,
-        service: request.service_name || '',
-        service_icon: serviceIcon,
-        address: request.address || '',
-        city: request.city || '',
-        notes: request.description || '',
-        scheduled_type: 'flexible',
-        price: bid.price || 0,
-        agreed_price: bid.price || 0,
-        status: 'confirmed',
-      });
-    } catch (_) { /* non-critical, matches Flutter's best-effort insert */ }
-
-    notify(bid.provider_id, 'Your bid was accepted!', `${request.customer_name} accepted your bid for ${request.service_name}`, 'booking', { requestId: request.id, bidId: bid.id });
-
+    // accept_bid() closes the request, makes the OTP, rejects the other bids,
+    // creates the booking and tells the providers - all in one step on the server
+    const { error } = await supabase.rpc('accept_bid', { p_bid_id: bid.id });
+    if (error) {
+      setAccepting(null);
+      alert(error.message);
+      return;
+    }
     setAccepting(null);
     onAccepted();
   };
@@ -587,7 +546,17 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
   const [topProvidersFilter, setTopProvidersFilter] = useState('Overall');
   const [cities, setCities] = useState([]);
   const [viewingProvider, setViewingProvider] = useState(null);
+  // same numbers the admin sets for the home page (Flutter reads these too)
+  const [homeStats, setHomeStats] = useState({ users: '', rating: '' });
+  const { getSiteSettings } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    getSiteSettings().then(data => {
+      const cms = data?.homeCMS || {};
+      setHomeStats({ users: cms.usersServedCount || '', rating: cms.averageRating || '' });
+    });
+  }, []);
 
   const viewProvider = async (p) => {
     const [{ data: userRows }, { data: profileRow }] = await Promise.all([
@@ -599,7 +568,7 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
   };
 
   const loadTopProviders = useCallback(async () => {
-    let q = supabase.from('users').select('*, provider_profiles!inner(*)').eq('role', 'provider');
+    let q = supabase.from('users').select('*, provider_profiles!inner(*)').eq('role', 'provider').eq('is_verified', true);
     if (topProvidersFilter === 'My Area') {
       if (user?.area) q = q.eq('area', user.area);
     } else if (topProvidersFilter !== 'Overall') {
@@ -709,7 +678,7 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
         <span style={{ fontWeight: 800, fontSize: '0.95rem' }}>Top Providers</span>
         <span style={{ fontSize: '0.8rem', color: PRIMARY, fontWeight: 700, cursor: 'pointer' }} onClick={onOpenDirectory}>See all</span>
       </div>
-      <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 8 }}>
+      <div className="chip-row" style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 8 }}>
         {topProvidersChips.map(chip => (
           <button key={chip} onClick={() => setTopProvidersFilter(chip)}
             style={{ flexShrink: 0, padding: '0.4rem 0.9rem', borderRadius: 100, background: topProvidersFilter === chip ? PRIMARY : colors.surface, border: `1px solid ${topProvidersFilter === chip ? PRIMARY : colors.border}`, color: 'white', fontSize: '0.72rem', fontWeight: 700, cursor: 'pointer' }}>
@@ -782,8 +751,8 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
       <PromoCarousel onSlideClick={() => onTabChange('ai')} />
       <StatsStrip items={[
-        { Icon: Shield, value: '100k+', label: 'Users Served', color: colors.primaryLight },
-        { Icon: Star, value: '4.8★', label: 'Avg Rating', color: '#FBBF24' },
+        { Icon: Shield, value: homeStats.users || '15k+', label: 'Users Served', color: colors.primaryLight },
+        { Icon: Star, value: homeStats.rating || '4.8★', label: 'Avg Rating', color: '#FBBF24' },
         { Icon: Zap, value: `${services.length || 20}+`, label: 'Services', color: colors.success },
       ]} />
       {providersBlock}
@@ -812,8 +781,8 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
         <>
           <PromoCarousel onSlideClick={() => onTabChange('ai')} />
           <StatsStrip items={[
-            { Icon: Shield, value: '100k+', label: 'Users Served', color: colors.primaryLight },
-            { Icon: Star, value: '4.8★', label: 'Avg Rating', color: '#FBBF24' },
+            { Icon: Shield, value: homeStats.users || '15k+', label: 'Users Served', color: colors.primaryLight },
+            { Icon: Star, value: homeStats.rating || '4.8★', label: 'Avg Rating', color: '#FBBF24' },
             { Icon: Zap, value: `${services.length || 20}+`, label: 'Services', color: colors.success },
           ]} />
           {servicesBlock}
@@ -821,7 +790,7 @@ const HomeTab = ({ user, onPostRequest, onTabChange, onOpenDirectory, unreadCoun
           {providersBlock}
         </>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: '1.75rem', alignItems: 'start' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', gap: '1.75rem', alignItems: 'start' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }}>
             {servicesBlock}
             {requestsBlock}
@@ -1265,7 +1234,7 @@ const CustomerDashboard = () => {
   ];
 
   const tabContent = {
-    home:     <HomeTab user={user} onPostRequest={openPostModal} onTabChange={setActiveTab} onOpenDirectory={() => setShowDirectory(true)} unreadCount={unreadCount} onOpenNotifications={() => setShowNotifications(true)} isMobile={isMobile} />,
+    home:     <HomeTab user={user} onPostRequest={openPostModal} onTabChange={setActiveTab} onOpenDirectory={() => setShowDirectory(true)} unreadCount={unreadCount} onOpenNotifications={() => setShowNotifications(true)} isMobile={windowWidth < 1100} />,
     requests: <RequestsTab user={user} />,
     chats:    <ChatsListTab user={user} role="user" />,
     bookings: <BookingsTab user={user} />,
